@@ -1,6 +1,8 @@
 import json
 import os
 import re
+import sqlite3
+from datetime import datetime, timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, BotCommand
 from telegram.ext import (
@@ -13,7 +15,12 @@ from telegram.ext import (
 )
 
 TOKEN = "8633256261:AAHBNFW5BzGsLLAHHRhy4I1HJJixD5759cM"
-ADMIN_CHAT_ID = 80263589  # @Alexandr_en
+ADMIN_CHAT_ID = 80263589
+ADMIN_USER_ID = 80263589
+
+PROFILES_FILE = "user_profiles.json"
+DB_FILE = "orders.db"
+MIN_ORDER_QTY = 6
 
 MENU = {
     "Мак н чиз": {
@@ -34,9 +41,6 @@ MENU = {
         "Борщ": 6,
     },
 }
-
-PROFILES_FILE = "user_profiles.json"
-MIN_ORDER_QTY = 6
 
 user_cart_store = {}
 
@@ -59,6 +63,124 @@ def save_profiles(data):
 user_profiles = load_profiles()
 
 
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            full_name TEXT,
+            username TEXT,
+            organization TEXT NOT NULL,
+            phone TEXT NOT NULL,
+            items_json TEXT NOT NULL,
+            total_amount REAL NOT NULL,
+            total_qty INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'new',
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def save_order_to_db(user_id, full_name, username, organization, phone, items, total_amount, total_qty):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    cursor.execute("""
+        INSERT INTO orders (
+            user_id, full_name, username, organization, phone,
+            items_json, total_amount, total_qty, status, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        str(user_id),
+        full_name,
+        username,
+        organization,
+        phone,
+        json.dumps(items, ensure_ascii=False),
+        total_amount,
+        total_qty,
+        "new",
+        created_at,
+    ))
+
+    order_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return order_id
+
+
+def update_order_status(order_id, status):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
+    conn.commit()
+    conn.close()
+
+
+def get_report(days=7):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    since_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+
+    cursor.execute("""
+        SELECT organization, status, total_amount, total_qty
+        FROM orders
+        WHERE created_at >= ?
+        ORDER BY created_at DESC
+    """, (since_date,))
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    total_orders = len(rows)
+    paid_orders = sum(1 for r in rows if r[1] == "paid")
+    unpaid_orders = sum(1 for r in rows if r[1] == "unpaid")
+    new_orders = sum(1 for r in rows if r[1] == "new")
+    paid_revenue = sum(r[2] for r in rows if r[1] == "paid")
+
+    org_stats = {}
+    for organization, status, amount, qty in rows:
+        if organization not in org_stats:
+            org_stats[organization] = {
+                "orders": 0,
+                "qty": 0,
+                "paid_orders": 0,
+                "unpaid_orders": 0,
+                "new_orders": 0,
+                "paid_amount": 0,
+            }
+
+        org_stats[organization]["orders"] += 1
+        org_stats[organization]["qty"] += qty
+
+        if status == "paid":
+            org_stats[organization]["paid_orders"] += 1
+            org_stats[organization]["paid_amount"] += amount
+        elif status == "unpaid":
+            org_stats[organization]["unpaid_orders"] += 1
+        elif status == "new":
+            org_stats[organization]["new_orders"] += 1
+
+    return {
+        "total_orders": total_orders,
+        "paid_orders": paid_orders,
+        "unpaid_orders": unpaid_orders,
+        "new_orders": new_orders,
+        "paid_revenue": paid_revenue,
+        "org_stats": org_stats,
+    }
+
+
 def is_valid_phone(phone: str) -> bool:
     cleaned = phone.strip()
     return bool(re.fullmatch(r"[\d\+\-\(\)\s]{6,20}", cleaned))
@@ -66,22 +188,6 @@ def is_valid_phone(phone: str) -> bool:
 
 def get_total_qty(items):
     return sum(item["qty"] for item in items)
-
-
-def main_menu_keyboard():
-    keyboard = [[InlineKeyboardButton(cat, callback_data=f"cat:{cat}")] for cat in MENU.keys()]
-    keyboard.append([InlineKeyboardButton("🛒 Корзина", callback_data="cart")])
-    keyboard.append([InlineKeyboardButton("⚙️ Профиль", callback_data="profile")])
-    return InlineKeyboardMarkup(keyboard)
-
-
-def profile_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("📞 Изменить телефон", callback_data="edit_phone")],
-        [InlineKeyboardButton("🏢 Изменить организацию", callback_data="edit_organization")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="back_main")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
 
 
 def format_cart(items):
@@ -100,6 +206,31 @@ def format_cart(items):
     return text, total
 
 
+def main_menu_keyboard():
+    keyboard = [[InlineKeyboardButton(cat, callback_data=f"cat:{cat}")] for cat in MENU.keys()]
+    keyboard.append([InlineKeyboardButton("🛒 Корзина", callback_data="cart")])
+    keyboard.append([InlineKeyboardButton("⚙️ Профиль", callback_data="profile")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def profile_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("📞 Изменить телефон", callback_data="edit_phone")],
+        [InlineKeyboardButton("🏢 Изменить организацию", callback_data="edit_organization")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="back_main")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def admin_order_keyboard(order_id):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Оплачен", callback_data=f"mark_paid:{order_id}"),
+            InlineKeyboardButton("❌ Не оплачен", callback_data=f"mark_unpaid:{order_id}"),
+        ]
+    ])
+
+
 async def show_main_menu_message(message):
     await message.reply_text("Выберите категорию:", reply_markup=main_menu_keyboard())
 
@@ -111,6 +242,8 @@ async def show_main_menu_callback(query):
 async def set_commands(application):
     commands = [
         BotCommand("start", "Открыть меню"),
+        BotCommand("week", "Отчёт за 7 дней"),
+        BotCommand("month", "Отчёт за 30 дней"),
     ]
     await application.bot.set_my_commands(commands)
 
@@ -280,7 +413,7 @@ async def cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if items:
         text += f"\nВсего штук: {total_qty}"
         if total_qty < MIN_ORDER_QTY:
-            text += f"\n\n⚠️ Минимальный заказ — от {MIN_ORDER_QTY} шт."
+            text += f"\n\n⚠️ Минимальный заказ — от {MIN_ORDER_QTY} шт суммарно по корзине."
 
     if total > 0:
         keyboard = [
@@ -322,7 +455,7 @@ async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_qty = get_total_qty(items)
     if total_qty < MIN_ORDER_QTY:
         await query.edit_message_text(
-            f"Минимальный заказ — от {MIN_ORDER_QTY} шт.\n"
+            f"Минимальный заказ — от {MIN_ORDER_QTY} шт суммарно по корзине.\n"
             f"Сейчас в корзине: {total_qty} шт.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🛒 Вернуться в корзину", callback_data="cart")],
@@ -373,7 +506,7 @@ async def final(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_qty = get_total_qty(items)
     if total_qty < MIN_ORDER_QTY:
         await query.edit_message_text(
-            f"Минимальный заказ — от {MIN_ORDER_QTY} шт.\n"
+            f"Минимальный заказ — от {MIN_ORDER_QTY} шт суммарно по корзине.\n"
             f"Сейчас в корзине: {total_qty} шт.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🛒 Вернуться в корзину", callback_data="cart")],
@@ -382,27 +515,43 @@ async def final(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    cart_text, _ = format_cart(items)
+    cart_text, total_amount = format_cart(items)
 
-    username = query.from_user.username
+    username = query.from_user.username or ""
     full_name = query.from_user.full_name
 
-    text = (
-        f"НОВЫЙ ЗАКАЗ\n\n"
+    order_id = save_order_to_db(
+        user_id=user_id,
+        full_name=full_name,
+        username=username,
+        organization=profile.get("organization", "-"),
+        phone=profile.get("phone", "-"),
+        items=items,
+        total_amount=total_amount,
+        total_qty=total_qty,
+    )
+
+    admin_text = (
+        f"НОВЫЙ ЗАКАЗ #{order_id}\n\n"
         f"Пользователь: {full_name}"
         f"{' (@' + username + ')' if username else ''}\n"
         f"Организация: {profile.get('organization', '-')}\n"
         f"Телефон: {profile.get('phone', '-')}\n\n"
         f"{cart_text}\n"
-        f"Всего штук: {total_qty}"
+        f"Всего штук: {total_qty}\n"
+        f"Статус: NEW"
     )
 
-    await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
+    await context.bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=admin_text,
+        reply_markup=admin_order_keyboard(order_id)
+    )
 
     user_cart_store[user_id] = []
 
     await query.edit_message_text(
-        "Заказ отправлен ✅",
+        f"Заказ отправлен ✅\nНомер заказа: #{order_id}",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🏠 В меню", callback_data="back_main")]
         ])
@@ -463,6 +612,112 @@ async def edit_organization(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("Введите новую организацию:")
 
 
+async def mark_order_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.from_user.id != ADMIN_USER_ID:
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+
+    action, order_id = query.data.split(":")
+    order_id = int(order_id)
+
+    if action == "mark_paid":
+        update_order_status(order_id, "paid")
+        new_status = "PAID"
+    else:
+        update_order_status(order_id, "unpaid")
+        new_status = "UNPAID"
+
+    text = query.message.text
+    lines = text.splitlines()
+
+    updated_lines = []
+    status_found = False
+
+    for line in lines:
+        if line.startswith("Статус:"):
+            updated_lines.append(f"Статус: {new_status}")
+            status_found = True
+        else:
+            updated_lines.append(line)
+
+    if not status_found:
+        updated_lines.append(f"Статус: {new_status}")
+
+    await query.edit_message_text(
+        "\n".join(updated_lines),
+        reply_markup=admin_order_keyboard(order_id)
+    )
+
+
+async def report_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_USER_ID:
+        return
+
+    report = get_report(days=7)
+
+    text = (
+        f"ОТЧЁТ ЗА 7 ДНЕЙ\n\n"
+        f"Всего заказов: {report['total_orders']}\n"
+        f"Новых: {report['new_orders']}\n"
+        f"Оплачено: {report['paid_orders']}\n"
+        f"Не оплачено: {report['unpaid_orders']}\n"
+        f"Оплаченная выручка: {report['paid_revenue']}₾\n\n"
+        f"ПО ОРГАНИЗАЦИЯМ:\n"
+    )
+
+    if not report["org_stats"]:
+        text += "\nНет заказов за этот период."
+    else:
+        for org, data in report["org_stats"].items():
+            text += (
+                f"\n— {org}\n"
+                f"Заказов: {data['orders']}\n"
+                f"Штук: {data['qty']}\n"
+                f"Новых: {data['new_orders']}\n"
+                f"Оплачено: {data['paid_orders']}\n"
+                f"Не оплачено: {data['unpaid_orders']}\n"
+                f"Оплаченная сумма: {data['paid_amount']}₾\n"
+            )
+
+    await update.message.reply_text(text)
+
+
+async def report_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_USER_ID:
+        return
+
+    report = get_report(days=30)
+
+    text = (
+        f"ОТЧЁТ ЗА 30 ДНЕЙ\n\n"
+        f"Всего заказов: {report['total_orders']}\n"
+        f"Новых: {report['new_orders']}\n"
+        f"Оплачено: {report['paid_orders']}\n"
+        f"Не оплачено: {report['unpaid_orders']}\n"
+        f"Оплаченная выручка: {report['paid_revenue']}₾\n\n"
+        f"ПО ОРГАНИЗАЦИЯМ:\n"
+    )
+
+    if not report["org_stats"]:
+        text += "\nНет заказов за этот период."
+    else:
+        for org, data in report["org_stats"].items():
+            text += (
+                f"\n— {org}\n"
+                f"Заказов: {data['orders']}\n"
+                f"Штук: {data['qty']}\n"
+                f"Новых: {data['new_orders']}\n"
+                f"Оплачено: {data['paid_orders']}\n"
+                f"Не оплачено: {data['unpaid_orders']}\n"
+                f"Оплаченная сумма: {data['paid_amount']}₾\n"
+            )
+
+    await update.message.reply_text(text)
+
+
 async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -481,9 +736,14 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    init_db()
+
     app = ApplicationBuilder().token(TOKEN).post_init(set_commands).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("week", report_week))
+    app.add_handler(CommandHandler("month", report_month))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, registration_handler))
 
     app.add_handler(CallbackQueryHandler(category, pattern=r"^cat:"))
@@ -496,6 +756,7 @@ def main():
     app.add_handler(CallbackQueryHandler(profile, pattern=r"^profile$"))
     app.add_handler(CallbackQueryHandler(edit_phone, pattern=r"^edit_phone$"))
     app.add_handler(CallbackQueryHandler(edit_organization, pattern=r"^edit_organization$"))
+    app.add_handler(CallbackQueryHandler(mark_order_status, pattern=r"^(mark_paid|mark_unpaid):"))
     app.add_handler(CallbackQueryHandler(back_main, pattern=r"^back_main$"))
     app.add_handler(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
 
