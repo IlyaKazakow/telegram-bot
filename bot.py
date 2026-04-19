@@ -36,6 +36,7 @@ MENU = {
 }
 
 PROFILES_FILE = "user_profiles.json"
+MIN_ORDER_QTY = 6
 
 user_cart_store = {}
 
@@ -61,6 +62,10 @@ user_profiles = load_profiles()
 def is_valid_phone(phone: str) -> bool:
     cleaned = phone.strip()
     return bool(re.fullmatch(r"[\d\+\-\(\)\s]{6,20}", cleaned))
+
+
+def get_total_qty(items):
+    return sum(item["qty"] for item in items)
 
 
 def main_menu_keyboard():
@@ -270,6 +275,12 @@ async def cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     items = user_cart_store.get(user_id, [])
 
     text, total = format_cart(items)
+    total_qty = get_total_qty(items)
+
+    if items:
+        text += f"\nВсего штук: {total_qty}"
+        if total_qty < MIN_ORDER_QTY:
+            text += f"\n\n⚠️ Минимальный заказ — от {MIN_ORDER_QTY} шт."
 
     if total > 0:
         keyboard = [
@@ -308,13 +319,26 @@ async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    total_qty = get_total_qty(items)
+    if total_qty < MIN_ORDER_QTY:
+        await query.edit_message_text(
+            f"Минимальный заказ — от {MIN_ORDER_QTY} шт.\n"
+            f"Сейчас в корзине: {total_qty} шт.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🛒 Вернуться в корзину", callback_data="cart")],
+                [InlineKeyboardButton("🏠 В меню", callback_data="back_main")]
+            ])
+        )
+        return
+
     cart_text, _ = format_cart(items)
 
     text = (
         f"Подтверждение заказа\n\n"
         f"Организация: {profile.get('organization', '-')}\n"
         f"Телефон: {profile.get('phone', '-')}\n\n"
-        f"{cart_text}"
+        f"{cart_text}\n"
+        f"Всего штук: {total_qty}"
     )
 
     keyboard = [
@@ -346,6 +370,18 @@ async def final(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    total_qty = get_total_qty(items)
+    if total_qty < MIN_ORDER_QTY:
+        await query.edit_message_text(
+            f"Минимальный заказ — от {MIN_ORDER_QTY} шт.\n"
+            f"Сейчас в корзине: {total_qty} шт.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🛒 Вернуться в корзину", callback_data="cart")],
+                [InlineKeyboardButton("🏠 В меню", callback_data="back_main")]
+            ])
+        )
+        return
+
     cart_text, _ = format_cart(items)
 
     username = query.from_user.username
@@ -357,7 +393,8 @@ async def final(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{' (@' + username + ')' if username else ''}\n"
         f"Организация: {profile.get('organization', '-')}\n"
         f"Телефон: {profile.get('phone', '-')}\n\n"
-        f"{cart_text}"
+        f"{cart_text}\n"
+        f"Всего штук: {total_qty}"
     )
 
     await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
