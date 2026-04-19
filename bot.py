@@ -2,7 +2,7 @@ import json
 import os
 import re
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, BotCommand
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -101,6 +101,13 @@ async def show_main_menu_message(message):
 
 async def show_main_menu_callback(query):
     await query.edit_message_text("Выберите категорию:", reply_markup=main_menu_keyboard())
+
+
+async def set_commands(application):
+    commands = [
+        BotCommand("start", "Открыть меню"),
+    ]
+    await application.bot.set_my_commands(commands)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -272,7 +279,7 @@ async def cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     else:
         keyboard = [
-            [InlineKeyboardButton("🔙 Назад", callback_data="back_main")],
+            [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
         ]
 
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
@@ -293,7 +300,12 @@ async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not items:
-        await query.edit_message_text("Корзина пуста.")
+        await query.edit_message_text(
+            "Корзина пуста.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏠 В меню", callback_data="back_main")]
+            ])
+        )
         return
 
     cart_text, _ = format_cart(items)
@@ -326,7 +338,12 @@ async def final(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not items:
-        await query.edit_message_text("Корзина пуста.")
+        await query.edit_message_text(
+            "Корзина пуста.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏠 В меню", callback_data="back_main")]
+            ])
+        )
         return
 
     cart_text, _ = format_cart(items)
@@ -347,7 +364,12 @@ async def final(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_cart_store[user_id] = []
 
-    await query.edit_message_text("Заказ отправлен ✅")
+    await query.edit_message_text(
+        "Заказ отправлен ✅",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏠 В меню", callback_data="back_main")]
+        ])
+    )
 
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -357,7 +379,13 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(query.from_user.id)
     user_cart_store[user_id] = []
 
-    await query.edit_message_text("Корзина очищена")
+    await query.edit_message_text(
+        "Корзина очищена ✅",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏠 В меню", callback_data="back_main")],
+            [InlineKeyboardButton("⚙️ Профиль", callback_data="profile")],
+        ])
+    )
 
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -407,11 +435,16 @@ async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("Отменено")
+    await query.edit_message_text(
+        "Отменено",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏠 В меню", callback_data="back_main")]
+        ])
+    )
 
 
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(TOKEN).post_init(set_commands).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, registration_handler))
