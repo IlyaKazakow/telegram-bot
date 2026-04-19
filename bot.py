@@ -37,7 +37,6 @@ MENU = {
 
 PROFILES_FILE = "user_profiles.json"
 
-# Корзины можно держать в памяти
 user_cart_store = {}
 
 
@@ -59,9 +58,24 @@ def save_profiles(data):
 user_profiles = load_profiles()
 
 
+def is_valid_phone(phone: str) -> bool:
+    cleaned = phone.strip()
+    return bool(re.fullmatch(r"[\d\+\-\(\)\s]{6,20}", cleaned))
+
+
 def main_menu_keyboard():
     keyboard = [[InlineKeyboardButton(cat, callback_data=f"cat:{cat}")] for cat in MENU.keys()]
     keyboard.append([InlineKeyboardButton("🛒 Корзина", callback_data="cart")])
+    keyboard.append([InlineKeyboardButton("⚙️ Профиль", callback_data="profile")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def profile_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("📞 Изменить телефон", callback_data="edit_phone")],
+        [InlineKeyboardButton("🏢 Изменить организацию", callback_data="edit_organization")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="back_main")],
+    ]
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -81,11 +95,6 @@ def format_cart(items):
     return text, total
 
 
-def is_valid_phone(phone: str) -> bool:
-    cleaned = phone.strip()
-    return bool(re.fullmatch(r"[\d\+\-\(\)\s]{6,20}", cleaned))
-
-
 async def show_main_menu_message(message):
     await message.reply_text("Выберите категорию:", reply_markup=main_menu_keyboard())
 
@@ -94,7 +103,6 @@ async def show_main_menu_callback(query):
     await query.edit_message_text("Выберите категорию:", reply_markup=main_menu_keyboard())
 
 
-# /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     profile = user_profiles.get(user_id)
@@ -110,20 +118,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_main_menu_message(update.message)
 
 
-# обработка регистрации
 async def registration_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    step = context.user_data.get("reg_step")
-    if not step:
+    mode = context.user_data.get("reg_step")
+    if not mode:
         return
 
     user_id = str(update.effective_user.id)
     text = update.message.text.strip()
 
-    if step == "phone":
+    if mode == "phone":
         if not is_valid_phone(text):
             await update.message.reply_text(
-                "Номер телефона введён некорректно.\n"
-                "Введите номер ещё раз:"
+                "Номер телефона введён некорректно.\nВведите номер ещё раз:"
             )
             return
 
@@ -132,7 +138,7 @@ async def registration_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Теперь введите организацию:")
         return
 
-    if step == "organization":
+    if mode == "organization":
         if not text:
             await update.message.reply_text("Организация не может быть пустой. Введите организацию:")
             return
@@ -148,9 +154,41 @@ async def registration_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
         await update.message.reply_text("Регистрация завершена ✅")
         await show_main_menu_message(update.message)
+        return
+
+    if mode == "edit_phone":
+        if not is_valid_phone(text):
+            await update.message.reply_text(
+                "Номер телефона введён некорректно.\nВведите номер ещё раз:"
+            )
+            return
+
+        user_profiles.setdefault(user_id, {})
+        user_profiles[user_id]["phone"] = text
+        save_profiles(user_profiles)
+
+        context.user_data.pop("reg_step", None)
+
+        await update.message.reply_text("Телефон обновлён ✅")
+        await show_main_menu_message(update.message)
+        return
+
+    if mode == "edit_organization":
+        if not text:
+            await update.message.reply_text("Организация не может быть пустой. Введите организацию:")
+            return
+
+        user_profiles.setdefault(user_id, {})
+        user_profiles[user_id]["organization"] = text
+        save_profiles(user_profiles)
+
+        context.user_data.pop("reg_step", None)
+
+        await update.message.reply_text("Организация обновлена ✅")
+        await show_main_menu_message(update.message)
+        return
 
 
-# категории
 async def category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -167,7 +205,6 @@ async def category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(cat, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-# выбор количества
 async def item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -175,9 +212,11 @@ async def item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, cat, item_name = query.data.split(":", 2)
     price = MENU[cat][item_name]
 
+    quantity_options = [3, 6, 12]
+
     keyboard = [
-        [InlineKeyboardButton(f"{i} шт", callback_data=f"add:{cat}:{item_name}:{i}")]
-        for i in range(1, 6)
+        [InlineKeyboardButton(f"{qty} шт", callback_data=f"add:{cat}:{item_name}:{qty}")]
+        for qty in quantity_options
     ]
     keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data=f"cat:{cat}")])
 
@@ -187,9 +226,10 @@ async def item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# добавить в корзину
 async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    await query.answer()
+
     _, cat, item_name, qty = query.data.split(":", 3)
 
     qty = int(qty)
@@ -215,7 +255,6 @@ async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# корзина
 async def cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -239,7 +278,6 @@ async def cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-# оформление заказа
 async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -258,12 +296,12 @@ async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Корзина пуста.")
         return
 
-    cart_text, total = format_cart(items)
+    cart_text, _ = format_cart(items)
 
     text = (
         f"Подтверждение заказа\n\n"
-        f"Организация: {profile['organization']}\n"
-        f"Телефон: {profile['phone']}\n\n"
+        f"Организация: {profile.get('organization', '-')}\n"
+        f"Телефон: {profile.get('phone', '-')}\n\n"
         f"{cart_text}"
     )
 
@@ -275,7 +313,6 @@ async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-# финальная отправка заказа админу
 async def final(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -292,7 +329,7 @@ async def final(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Корзина пуста.")
         return
 
-    cart_text, total = format_cart(items)
+    cart_text, _ = format_cart(items)
 
     username = query.from_user.username
     full_name = query.from_user.full_name
@@ -301,8 +338,8 @@ async def final(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"НОВЫЙ ЗАКАЗ\n\n"
         f"Пользователь: {full_name}"
         f"{' (@' + username + ')' if username else ''}\n"
-        f"Организация: {profile['organization']}\n"
-        f"Телефон: {profile['phone']}\n\n"
+        f"Организация: {profile.get('organization', '-')}\n"
+        f"Телефон: {profile.get('phone', '-')}\n\n"
         f"{cart_text}"
     )
 
@@ -313,22 +350,60 @@ async def final(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("Заказ отправлен ✅")
 
 
-# очистка корзины
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    await query.answer()
+
     user_id = str(query.from_user.id)
     user_cart_store[user_id] = []
+
     await query.edit_message_text("Корзина очищена")
 
 
-# назад в меню
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = str(query.from_user.id)
+    profile_data = user_profiles.get(user_id)
+
+    if not profile_data:
+        await query.edit_message_text(
+            "Профиль не найден.\nНажмите /start для регистрации."
+        )
+        return
+
+    text = (
+        "Ваш профиль:\n\n"
+        f"Телефон: {profile_data.get('phone', '-')}\n"
+        f"Организация: {profile_data.get('organization', '-')}"
+    )
+
+    await query.edit_message_text(text, reply_markup=profile_keyboard())
+
+
+async def edit_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["reg_step"] = "edit_phone"
+    await query.edit_message_text("Введите новый номер телефона:")
+
+
+async def edit_organization(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["reg_step"] = "edit_organization"
+    await query.edit_message_text("Введите новую организацию:")
+
+
 async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await show_main_menu_callback(query)
 
 
-# отмена
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -348,6 +423,9 @@ def main():
     app.add_handler(CallbackQueryHandler(checkout, pattern=r"^checkout$"))
     app.add_handler(CallbackQueryHandler(final, pattern=r"^final$"))
     app.add_handler(CallbackQueryHandler(clear, pattern=r"^clear$"))
+    app.add_handler(CallbackQueryHandler(profile, pattern=r"^profile$"))
+    app.add_handler(CallbackQueryHandler(edit_phone, pattern=r"^edit_phone$"))
+    app.add_handler(CallbackQueryHandler(edit_organization, pattern=r"^edit_organization$"))
     app.add_handler(CallbackQueryHandler(back_main, pattern=r"^back_main$"))
     app.add_handler(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
 
