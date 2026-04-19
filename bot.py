@@ -4,7 +4,14 @@ import re
 import sqlite3
 from datetime import datetime, timedelta
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, BotCommand
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeChat,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -240,12 +247,21 @@ async def show_main_menu_callback(query):
 
 
 async def set_commands(application):
-    commands = [
-        BotCommand("start", "Открыть меню"),
-        BotCommand("week", "Отчёт за 7 дней"),
-        BotCommand("month", "Отчёт за 30 дней"),
-    ]
-    await application.bot.set_my_commands(commands)
+    await application.bot.set_my_commands(
+        commands=[
+            BotCommand("start", "Открыть меню"),
+        ],
+        scope=BotCommandScopeDefault()
+    )
+
+    await application.bot.set_my_commands(
+        commands=[
+            BotCommand("start", "Открыть меню"),
+            BotCommand("week", "Отчёт за 7 дней"),
+            BotCommand("month", "Отчёт за 30 дней"),
+        ],
+        scope=BotCommandScopeChat(chat_id=ADMIN_USER_ID)
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -614,11 +630,12 @@ async def edit_organization(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def mark_order_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
 
     if query.from_user.id != ADMIN_USER_ID:
         await query.answer("Недостаточно прав", show_alert=True)
         return
+
+    await query.answer()
 
     action, order_id = query.data.split(":")
     order_id = int(order_id)
@@ -654,6 +671,7 @@ async def mark_order_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def report_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("У вас нет доступа к этой команде.")
         return
 
     report = get_report(days=7)
@@ -687,6 +705,7 @@ async def report_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def report_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("У вас нет доступа к этой команде.")
         return
 
     report = get_report(days=30)
