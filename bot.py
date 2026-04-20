@@ -22,8 +22,8 @@ from telegram.ext import (
 )
 
 TOKEN = "8633256261:AAHBNFW5BzGsLLAHHRhy4I1HJJixD5759cM"
-ADMIN_CHAT_ID = 80263589
-ADMIN_USER_ID = 80263589
+
+ADMIN_USER_IDS = {80263589, 374698952}
 
 DATA_DIR = os.getenv("DATA_DIR", "./data")
 DB_FILE = os.path.join(DATA_DIR, "bot.db")
@@ -481,17 +481,18 @@ async def set_commands(application):
         scope=BotCommandScopeAllPrivateChats()
     )
 
-    await application.bot.set_my_commands(
-        commands=[
-            BotCommand("start", "Открыть меню"),
-            BotCommand("week", "Отчёт за 7 дней"),
-            BotCommand("month", "Отчёт за 30 дней"),
-            BotCommand("last_month", "Отчёт за прошлый месяц"),
-            BotCommand("profiles", "Все профили"),
-            BotCommand("pending_profiles", "Профили без подтверждения"),
-        ],
-        scope=BotCommandScopeChat(chat_id=ADMIN_USER_ID)
-    )
+    for admin_id in ADMIN_USER_IDS:
+        await application.bot.set_my_commands(
+            commands=[
+                BotCommand("start", "Открыть меню"),
+                BotCommand("week", "Отчёт за 7 дней"),
+                BotCommand("month", "Отчёт за 30 дней"),
+                BotCommand("last_month", "Отчёт за прошлый месяц"),
+                BotCommand("profiles", "Все профили"),
+                BotCommand("pending_profiles", "Профили без подтверждения"),
+            ],
+            scope=BotCommandScopeChat(chat_id=admin_id)
+        )
 
 
 async def notify_admin_about_profile(profile, duplicates, context: ContextTypes.DEFAULT_TYPE):
@@ -516,11 +517,12 @@ async def notify_admin_about_profile(profile, duplicates, context: ContextTypes.
                 f"user_id={d['user_id']}, org={d['organization_original']}\n"
             )
 
-    await context.bot.send_message(
-        chat_id=ADMIN_CHAT_ID,
-        text=text,
-        reply_markup=admin_profile_confirm_keyboard(profile["user_id"])
-    )
+    for admin_id in ADMIN_USER_IDS:
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text=text,
+            reply_markup=admin_profile_confirm_keyboard(profile["user_id"])
+        )
 
 
 async def notify_admin_about_pending_order(order_id, full_name, username, phone_original, phone_normalized, organization_original, context):
@@ -534,11 +536,12 @@ async def notify_admin_about_pending_order(order_id, full_name, username, phone_
         f"Статус организации: pending"
     )
 
-    await context.bot.send_message(
-        chat_id=ADMIN_CHAT_ID,
-        text=text,
-        reply_markup=admin_order_confirm_keyboard(order_id)
-    )
+    for admin_id in ADMIN_USER_IDS:
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text=text,
+            reply_markup=admin_order_confirm_keyboard(order_id)
+        )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -874,11 +877,12 @@ async def final(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Статус оплаты: NEW"
     )
 
-    await context.bot.send_message(
-        chat_id=ADMIN_CHAT_ID,
-        text=admin_text,
-        reply_markup=admin_order_keyboard(order_id)
-    )
+    for admin_id in ADMIN_USER_IDS:
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text=admin_text,
+            reply_markup=admin_order_keyboard(order_id)
+        )
 
     if profile["organization_status"] != "confirmed":
         await notify_admin_about_pending_order(
@@ -960,7 +964,7 @@ async def edit_organization(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def mark_order_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
 
-    if query.from_user.id != ADMIN_USER_ID:
+    if query.from_user.id not in ADMIN_USER_IDS:
         await query.answer("Недостаточно прав", show_alert=True)
         return
 
@@ -1000,7 +1004,7 @@ async def mark_order_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def confirm_profile_org(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id != ADMIN_USER_ID:
+    if query.from_user.id not in ADMIN_USER_IDS:
         await query.answer("Недостаточно прав", show_alert=True)
         return
 
@@ -1026,7 +1030,7 @@ async def confirm_profile_org(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def keep_profile_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id != ADMIN_USER_ID:
+    if query.from_user.id not in ADMIN_USER_IDS:
         await query.answer("Недостаточно прав", show_alert=True)
         return
 
@@ -1035,7 +1039,7 @@ async def keep_profile_pending(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def confirm_order_org(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id != ADMIN_USER_ID:
+    if query.from_user.id not in ADMIN_USER_IDS:
         await query.answer("Недостаточно прав", show_alert=True)
         return
 
@@ -1071,7 +1075,7 @@ async def confirm_order_org(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def keep_order_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id != ADMIN_USER_ID:
+    if query.from_user.id not in ADMIN_USER_IDS:
         await query.answer("Недостаточно прав", show_alert=True)
         return
 
@@ -1107,7 +1111,7 @@ def format_report_text(title, report):
 
 
 async def report_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_USER_ID:
+    if update.effective_user.id not in ADMIN_USER_IDS:
         await update.message.reply_text("У вас нет доступа к этой команде.")
         return
 
@@ -1116,7 +1120,7 @@ async def report_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def report_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_USER_ID:
+    if update.effective_user.id not in ADMIN_USER_IDS:
         await update.message.reply_text("У вас нет доступа к этой команде.")
         return
 
@@ -1125,7 +1129,7 @@ async def report_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def report_last_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_USER_ID:
+    if update.effective_user.id not in ADMIN_USER_IDS:
         await update.message.reply_text("У вас нет доступа к этой команде.")
         return
 
@@ -1136,7 +1140,7 @@ async def report_last_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def profiles_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_USER_ID:
+    if update.effective_user.id not in ADMIN_USER_IDS:
         await update.message.reply_text("У вас нет доступа к этой команде.")
         return
 
@@ -1176,7 +1180,7 @@ async def profiles_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def pending_profiles_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_USER_ID:
+    if update.effective_user.id not in ADMIN_USER_IDS:
         await update.message.reply_text("У вас нет доступа к этой команде.")
         return
 
@@ -1233,8 +1237,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    if os.path.exists(DB_FILE):
-        os.remove(DB_FILE)
     init_db()
 
     app = ApplicationBuilder().token(TOKEN).post_init(set_commands).build()
@@ -1273,3 +1275,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
