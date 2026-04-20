@@ -9,7 +9,7 @@ from telegram import (
     InlineKeyboardMarkup,
     Update,
     BotCommand,
-    BotCommandScopeDefault,
+    BotCommandScopeAllPrivateChats,
     BotCommandScopeChat,
 )
 from telegram.ext import (
@@ -25,8 +25,8 @@ TOKEN = "8633256261:AAHBNFW5BzGsLLAHHRhy4I1HJJixD5759cM"
 ADMIN_CHAT_ID = 80263589
 ADMIN_USER_ID = 80263589
 
-PROFILES_FILE = "user_profiles.json"
-DB_FILE = "orders.db"
+DATA_DIR = os.getenv("DATA_DIR", "/data")
+DB_FILE = os.path.join(DATA_DIR, "bot.db")
 MIN_ORDER_QTY = 6
 
 MENU = {
@@ -52,27 +52,27 @@ MENU = {
 user_cart_store = {}
 
 
-def load_profiles():
-    if os.path.exists(PROFILES_FILE):
-        try:
-            with open(PROFILES_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+def ensure_data_dir():
+    os.makedirs(DATA_DIR, exist_ok=True)
 
 
-def save_profiles(data):
-    with open(PROFILES_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-user_profiles = load_profiles()
+def get_connection():
+    ensure_data_dir()
+    return sqlite3.connect(DB_FILE)
 
 
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_connection()
     cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS profiles (
+            user_id TEXT PRIMARY KEY,
+            phone TEXT NOT NULL,
+            organization TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS orders (
@@ -94,8 +94,52 @@ def init_db():
     conn.close()
 
 
+def save_profile(user_id, phone, organization):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO profiles (user_id, phone, organization, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            phone = excluded.phone,
+            organization = excluded.organization,
+            updated_at = excluded.updated_at
+    """, (
+        str(user_id),
+        phone,
+        organization,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def get_profile(user_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT phone, organization
+        FROM profiles
+        WHERE user_id = ?
+    """, (str(user_id),))
+
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    return {
+        "phone": row[0],
+        "organization": row[1],
+    }
+
+
 def save_order_to_db(user_id, full_name, username, organization, phone, items, total_amount, total_qty):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_connection()
     cursor = conn.cursor()
 
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -126,7 +170,7 @@ def save_order_to_db(user_id, full_name, username, organization, phone, items, t
 
 
 def update_order_status(order_id, status):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
     conn.commit()
@@ -134,7 +178,7 @@ def update_order_status(order_id, status):
 
 
 def get_report(days=7):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_connection()
     cursor = conn.cursor()
 
     since_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
@@ -251,7 +295,7 @@ async def set_commands(application):
         commands=[
             BotCommand("start", "Открыть меню"),
         ],
-        scope=BotCommandScopeDefault()
+        scope=BotCommandScopeAllPrivateChats()
     )
 
     await application.bot.set_my_commands(
@@ -266,7 +310,7 @@ async def set_commands(application):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    profile = user_profiles.get(user_id)
+    profile = get_profile(user_id)
 
     if not profile:
         context.user_data["reg_step"] = "phone"
@@ -304,11 +348,11 @@ async def registration_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("Организация не может быть пустой. Введите организацию:")
             return
 
-        user_profiles[user_id] = {
-            "phone": context.user_data.get("phone", ""),
-            "organization": text,
-        }
-        save_profiles(user_profiles)
+        save_profile(
+            user_id=user_id,
+            phone=context.user_data.get("phone", ""),
+            organization=text,
+        )
 
         context.user_data.pop("reg_step", None)
         context.user_data.pop("phone", None)
@@ -324,9 +368,14 @@ async def registration_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return
 
-        user_profiles.setdefault(user_id, {})
-        user_profiles[user_id]["phone"] = text
-        save_profiles(user_profiles)
+        current_profile = get_profile(user_id)
+        organization = current_profile["organization"] if current_profile else "-"
+
+        save_profile(
+            user_id=user_id,
+            phone=text,
+            organization=organization,
+        )
 
         context.user_data.pop("reg_step", None)
 
@@ -339,9 +388,14 @@ async def registration_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("Организация не может быть пустой. Введите организацию:")
             return
 
-        user_profiles.setdefault(user_id, {})
-        user_profiles[user_id]["organization"] = text
-        save_profiles(user_profiles)
+        current_profile = get_profile(user_id)
+        phone = current_profile["phone"] if current_profile else "-"
+
+        save_profile(
+            user_id=user_id,
+            phone=phone,
+            organization=text,
+        )
 
         context.user_data.pop("reg_step", None)
 
@@ -450,7 +504,7 @@ async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     user_id = str(query.from_user.id)
-    profile = user_profiles.get(user_id)
+    profile = get_profile(user_id)
     items = user_cart_store.get(user_id, [])
 
     if not profile:
@@ -504,7 +558,7 @@ async def final(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = str(query.from_user.id)
     items = user_cart_store.get(user_id, [])
-    profile = user_profiles.get(user_id)
+    profile = get_profile(user_id)
 
     if not profile:
         await query.edit_message_text("Профиль не найден. Нажмите /start и зарегистрируйтесь снова.")
@@ -595,7 +649,7 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     user_id = str(query.from_user.id)
-    profile_data = user_profiles.get(user_id)
+    profile_data = get_profile(user_id)
 
     if not profile_data:
         await query.edit_message_text(
@@ -779,6 +833,7 @@ def main():
     app.add_handler(CallbackQueryHandler(back_main, pattern=r"^back_main$"))
     app.add_handler(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
 
+    print(f"Bot DB path: {DB_FILE}")
     print("Bot started...")
     app.run_polling()
 
