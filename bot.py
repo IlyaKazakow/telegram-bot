@@ -2,7 +2,7 @@ import json
 import os
 import re
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 from telegram import (
     InlineKeyboardButton,
@@ -25,16 +25,23 @@ TOKEN = "8633256261:AAHBNFW5BzGsLLAHHRhy4I1HJJixD5759cM"
 ADMIN_CHAT_ID = 80263589
 ADMIN_USER_ID = 80263589
 
-DATA_DIR = os.getenv("DATA_DIR", "/data")
+DATA_DIR = os.getenv("DATA_DIR", "./data")
 DB_FILE = os.path.join(DATA_DIR, "bot.db")
 MIN_ORDER_QTY = 6
+
+CANONICAL_ORGANIZATIONS = [
+    "Севен роадс",
+    "Гибрид",
+    "Ред дор",
+    "Сей ес",
+]
 
 MENU = {
     "Мак н чиз": {
         "Курица": 5,
         "Бекон": 7,
         "Рваная свинина": 7,
-        "Чили конкарнэ": 12,
+        "Чили конкарнэ": 11,
         "С сыром": 5,
     },
     "Сырники": {
@@ -58,183 +65,31 @@ def ensure_data_dir():
 
 def get_connection():
     ensure_data_dir()
-    return sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def init_db():
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS profiles (
-            user_id TEXT PRIMARY KEY,
-            phone TEXT NOT NULL,
-            organization TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            full_name TEXT,
-            username TEXT,
-            organization TEXT NOT NULL,
-            phone TEXT NOT NULL,
-            items_json TEXT NOT NULL,
-            total_amount REAL NOT NULL,
-            total_qty INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'new',
-            created_at TEXT NOT NULL
-        )
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-def save_profile(user_id, phone, organization):
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        INSERT INTO profiles (user_id, phone, organization, updated_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            phone = excluded.phone,
-            organization = excluded.organization,
-            updated_at = excluded.updated_at
-    """, (
-        str(user_id),
-        phone,
-        organization,
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    ))
-
-    conn.commit()
-    conn.close()
-
-
-def get_profile(user_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT phone, organization
-        FROM profiles
-        WHERE user_id = ?
-    """, (str(user_id),))
-
-    row = cursor.fetchone()
-    conn.close()
-
-    if not row:
-        return None
-
-    return {
-        "phone": row[0],
-        "organization": row[1],
-    }
-
-
-def save_order_to_db(user_id, full_name, username, organization, phone, items, total_amount, total_qty):
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    cursor.execute("""
-        INSERT INTO orders (
-            user_id, full_name, username, organization, phone,
-            items_json, total_amount, total_qty, status, created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        str(user_id),
-        full_name,
-        username,
-        organization,
-        phone,
-        json.dumps(items, ensure_ascii=False),
-        total_amount,
-        total_qty,
-        "new",
-        created_at,
-    ))
-
-    order_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    return order_id
-
-
-def update_order_status(order_id, status):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
-    conn.commit()
-    conn.close()
-
-
-def get_report(days=7):
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    since_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-
-    cursor.execute("""
-        SELECT organization, status, total_amount, total_qty
-        FROM orders
-        WHERE created_at >= ?
-        ORDER BY created_at DESC
-    """, (since_date,))
-
-    rows = cursor.fetchall()
-    conn.close()
-
-    total_orders = len(rows)
-    paid_orders = sum(1 for r in rows if r[1] == "paid")
-    unpaid_orders = sum(1 for r in rows if r[1] == "unpaid")
-    new_orders = sum(1 for r in rows if r[1] == "new")
-    paid_revenue = sum(r[2] for r in rows if r[1] == "paid")
-
-    org_stats = {}
-    for organization, status, amount, qty in rows:
-        if organization not in org_stats:
-            org_stats[organization] = {
-                "orders": 0,
-                "qty": 0,
-                "paid_orders": 0,
-                "unpaid_orders": 0,
-                "new_orders": 0,
-                "paid_amount": 0,
-            }
-
-        org_stats[organization]["orders"] += 1
-        org_stats[organization]["qty"] += qty
-
-        if status == "paid":
-            org_stats[organization]["paid_orders"] += 1
-            org_stats[organization]["paid_amount"] += amount
-        elif status == "unpaid":
-            org_stats[organization]["unpaid_orders"] += 1
-        elif status == "new":
-            org_stats[organization]["new_orders"] += 1
-
-    return {
-        "total_orders": total_orders,
-        "paid_orders": paid_orders,
-        "unpaid_orders": unpaid_orders,
-        "new_orders": new_orders,
-        "paid_revenue": paid_revenue,
-        "org_stats": org_stats,
-    }
+def normalize_phone(phone: str) -> str:
+    phone = phone.strip()
+    if phone.startswith("+"):
+        return "+" + re.sub(r"\D", "", phone[1:])
+    return re.sub(r"\D", "", phone)
 
 
 def is_valid_phone(phone: str) -> bool:
-    cleaned = phone.strip()
-    return bool(re.fullmatch(r"[\d\+\-\(\)\s]{6,20}", cleaned))
+    normalized = normalize_phone(phone)
+    digits_only = normalized[1:] if normalized.startswith("+") else normalized
+    return 6 <= len(digits_only) <= 20
+
+
+def normalize_org_text(text: str) -> str:
+    value = text.strip().lower()
+    value = value.replace("ё", "е")
+    value = value.replace("-", " ")
+    value = re.sub(r"[\"'`.,;:!?(){}\[\]/\\]+", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
 
 
 def get_total_qty(items):
@@ -282,6 +137,334 @@ def admin_order_keyboard(order_id):
     ])
 
 
+def admin_profile_confirm_keyboard(user_id):
+    rows = []
+    for org in CANONICAL_ORGANIZATIONS:
+        rows.append([InlineKeyboardButton(org, callback_data=f"confirm_profile_org:{user_id}:{org}")])
+    rows.append([InlineKeyboardButton("⏳ Оставить без подтверждения", callback_data=f"keep_profile_pending:{user_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_order_confirm_keyboard(order_id):
+    rows = []
+    for org in CANONICAL_ORGANIZATIONS:
+        rows.append([InlineKeyboardButton(org, callback_data=f"confirm_order_org:{order_id}:{org}")])
+    rows.append([InlineKeyboardButton("⏳ Оставить без подтверждения", callback_data=f"keep_order_pending:{order_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def init_db():
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS profiles (
+            user_id TEXT PRIMARY KEY,
+            full_name TEXT,
+            username TEXT,
+            phone_original TEXT NOT NULL,
+            phone_normalized TEXT NOT NULL,
+            organization_original TEXT NOT NULL,
+            organization_canonical TEXT,
+            organization_status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            full_name TEXT,
+            username TEXT,
+            phone_original TEXT NOT NULL,
+            phone_normalized TEXT NOT NULL,
+            organization_original TEXT NOT NULL,
+            organization_canonical TEXT,
+            organization_status TEXT NOT NULL DEFAULT 'pending',
+            items_json TEXT NOT NULL,
+            total_amount REAL NOT NULL,
+            total_qty INTEGER NOT NULL,
+            payment_status TEXT NOT NULL DEFAULT 'new',
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def save_profile(user_id, full_name, username, phone_original, organization_original):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    phone_normalized = normalize_phone(phone_original)
+
+    existing = get_profile(user_id)
+
+    if existing:
+        organization_canonical = existing["organization_canonical"]
+        organization_status = existing["organization_status"]
+    else:
+        organization_canonical = None
+        organization_status = "pending"
+
+    cursor.execute("""
+        INSERT INTO profiles (
+            user_id, full_name, username,
+            phone_original, phone_normalized,
+            organization_original, organization_canonical, organization_status,
+            created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            full_name = excluded.full_name,
+            username = excluded.username,
+            phone_original = excluded.phone_original,
+            phone_normalized = excluded.phone_normalized,
+            organization_original = excluded.organization_original,
+            updated_at = excluded.updated_at
+    """, (
+        str(user_id),
+        full_name,
+        username,
+        phone_original,
+        phone_normalized,
+        organization_original,
+        organization_canonical,
+        organization_status,
+        existing["created_at"] if existing else now,
+        now,
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def get_profile(user_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM profiles WHERE user_id = ?", (str(user_id),))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_duplicate_profiles_by_phone(phone_normalized, exclude_user_id=None):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    if exclude_user_id:
+        cursor.execute("""
+            SELECT * FROM profiles
+            WHERE phone_normalized = ? AND user_id != ?
+            ORDER BY created_at DESC
+        """, (phone_normalized, str(exclude_user_id)))
+    else:
+        cursor.execute("""
+            SELECT * FROM profiles
+            WHERE phone_normalized = ?
+            ORDER BY created_at DESC
+        """, (phone_normalized,))
+
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def set_profile_canonical_org(user_id, canonical_org):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE profiles
+        SET organization_canonical = ?, organization_status = 'confirmed', updated_at = ?
+        WHERE user_id = ?
+    """, (
+        canonical_org,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        str(user_id),
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def save_order_to_db(
+    user_id,
+    full_name,
+    username,
+    phone_original,
+    phone_normalized,
+    organization_original,
+    organization_canonical,
+    organization_status,
+    items,
+    total_amount,
+    total_qty,
+):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    cursor.execute("""
+        INSERT INTO orders (
+            user_id, full_name, username,
+            phone_original, phone_normalized,
+            organization_original, organization_canonical, organization_status,
+            items_json, total_amount, total_qty, payment_status, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        str(user_id),
+        full_name,
+        username,
+        phone_original,
+        phone_normalized,
+        organization_original,
+        organization_canonical,
+        organization_status,
+        json.dumps(items, ensure_ascii=False),
+        total_amount,
+        total_qty,
+        "new",
+        created_at,
+    ))
+
+    order_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return order_id
+
+
+def set_order_canonical_org(order_id, canonical_org):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE orders
+        SET organization_canonical = ?, organization_status = 'confirmed'
+        WHERE id = ?
+    """, (canonical_org, int(order_id)))
+
+    conn.commit()
+    conn.close()
+
+
+def update_order_payment_status(order_id, status):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE orders SET payment_status = ? WHERE id = ?", (status, int(order_id)))
+    conn.commit()
+    conn.close()
+
+
+def get_profiles(limit=500):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT * FROM profiles
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_pending_profiles(limit=200):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT * FROM profiles
+        WHERE organization_status = 'pending'
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_period_range_last_month():
+    today = date.today()
+    first_day_current_month = date(today.year, today.month, 1)
+    last_day_previous_month = first_day_current_month - timedelta(days=1)
+    first_day_previous_month = date(last_day_previous_month.year, last_day_previous_month.month, 1)
+
+    start_dt = datetime.combine(first_day_previous_month, datetime.min.time()).strftime("%Y-%m-%d %H:%M:%S")
+    end_dt = datetime.combine(first_day_current_month, datetime.min.time()).strftime("%Y-%m-%d %H:%M:%S")
+
+    return start_dt, end_dt, first_day_previous_month, last_day_previous_month
+
+
+def get_report_by_range(start_date_str, end_date_str):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT organization_canonical, organization_status, payment_status, total_amount, total_qty
+        FROM orders
+        WHERE created_at >= ? AND created_at < ?
+        ORDER BY created_at DESC
+    """, (start_date_str, end_date_str))
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    total_orders = len(rows)
+    paid_orders = sum(1 for r in rows if r["payment_status"] == "paid")
+    unpaid_orders = sum(1 for r in rows if r["payment_status"] == "unpaid")
+    new_orders = sum(1 for r in rows if r["payment_status"] == "new")
+    paid_revenue = sum(r["total_amount"] for r in rows if r["payment_status"] == "paid")
+
+    org_stats = {}
+    for r in rows:
+        org = r["organization_canonical"] if r["organization_canonical"] else "⏳ Неподтверждённые"
+        if org not in org_stats:
+            org_stats[org] = {
+                "orders": 0,
+                "qty": 0,
+                "paid_orders": 0,
+                "unpaid_orders": 0,
+                "new_orders": 0,
+                "paid_amount": 0,
+            }
+
+        org_stats[org]["orders"] += 1
+        org_stats[org]["qty"] += r["total_qty"]
+
+        if r["payment_status"] == "paid":
+            org_stats[org]["paid_orders"] += 1
+            org_stats[org]["paid_amount"] += r["total_amount"]
+        elif r["payment_status"] == "unpaid":
+            org_stats[org]["unpaid_orders"] += 1
+        elif r["payment_status"] == "new":
+            org_stats[org]["new_orders"] += 1
+
+    return {
+        "total_orders": total_orders,
+        "paid_orders": paid_orders,
+        "unpaid_orders": unpaid_orders,
+        "new_orders": new_orders,
+        "paid_revenue": paid_revenue,
+        "org_stats": org_stats,
+    }
+
+
+def get_report_last_n_days(days=7):
+    end_dt = datetime.now()
+    start_dt = end_dt - timedelta(days=days)
+    return get_report_by_range(
+        start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+    )
+
+
 async def show_main_menu_message(message):
     await message.reply_text("Выберите категорию:", reply_markup=main_menu_keyboard())
 
@@ -303,8 +486,58 @@ async def set_commands(application):
             BotCommand("start", "Открыть меню"),
             BotCommand("week", "Отчёт за 7 дней"),
             BotCommand("month", "Отчёт за 30 дней"),
+            BotCommand("last_month", "Отчёт за прошлый месяц"),
+            BotCommand("profiles", "Все профили"),
+            BotCommand("pending_profiles", "Профили без подтверждения"),
         ],
         scope=BotCommandScopeChat(chat_id=ADMIN_USER_ID)
+    )
+
+
+async def notify_admin_about_profile(profile, duplicates, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "НОВЫЙ / ОБНОВЛЁННЫЙ ПРОФИЛЬ\n\n"
+        f"Пользователь: {profile.get('full_name') or '-'}"
+        f"{' (@' + profile.get('username') + ')' if profile.get('username') else ''}\n"
+        f"User ID: {profile['user_id']}\n"
+        f"Телефон: {profile['phone_original']}\n"
+        f"Телефон normalized: {profile['phone_normalized']}\n"
+        f"Организация original: {profile['organization_original']}\n"
+        f"Организация canonical: {profile['organization_canonical'] or '-'}\n"
+        f"Статус организации: {profile['organization_status']}\n"
+    )
+
+    if duplicates:
+        text += "\n⚠️ Найдены дубли по номеру:\n"
+        for d in duplicates[:10]:
+            text += (
+                f"- {d.get('full_name') or '-'}"
+                f"{' (@' + d.get('username') + ')' if d.get('username') else ''}, "
+                f"user_id={d['user_id']}, org={d['organization_original']}\n"
+            )
+
+    await context.bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=text,
+        reply_markup=admin_profile_confirm_keyboard(profile["user_id"])
+    )
+
+
+async def notify_admin_about_pending_order(order_id, full_name, username, phone_original, phone_normalized, organization_original, context):
+    text = (
+        f"ЗАКАЗ #{order_id} ТРЕБУЕТ ПОДТВЕРЖДЕНИЯ ОРГАНИЗАЦИИ\n\n"
+        f"Пользователь: {full_name}"
+        f"{' (@' + username + ')' if username else ''}\n"
+        f"Телефон: {phone_original}\n"
+        f"Телефон normalized: {phone_normalized}\n"
+        f"Организация original: {organization_original}\n"
+        f"Статус организации: pending"
+    )
+
+    await context.bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=text,
+        reply_markup=admin_order_confirm_keyboard(order_id)
     )
 
 
@@ -329,6 +562,8 @@ async def registration_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     user_id = str(update.effective_user.id)
+    full_name = update.effective_user.full_name
+    username = update.effective_user.username or ""
     text = update.message.text.strip()
 
     if mode == "phone":
@@ -338,7 +573,7 @@ async def registration_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return
 
-        context.user_data["phone"] = text
+        context.user_data["phone_original"] = text
         context.user_data["reg_step"] = "organization"
         await update.message.reply_text("Теперь введите организацию:")
         return
@@ -350,15 +585,22 @@ async def registration_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
         save_profile(
             user_id=user_id,
-            phone=context.user_data.get("phone", ""),
-            organization=text,
+            full_name=full_name,
+            username=username,
+            phone_original=context.user_data.get("phone_original", ""),
+            organization_original=text,
         )
 
+        profile = get_profile(user_id)
+        duplicates = get_duplicate_profiles_by_phone(profile["phone_normalized"], exclude_user_id=user_id)
+
         context.user_data.pop("reg_step", None)
-        context.user_data.pop("phone", None)
+        context.user_data.pop("phone_original", None)
 
         await update.message.reply_text("Регистрация завершена ✅")
         await show_main_menu_message(update.message)
+
+        await notify_admin_about_profile(profile, duplicates, context)
         return
 
     if mode == "edit_phone":
@@ -369,18 +611,25 @@ async def registration_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             return
 
         current_profile = get_profile(user_id)
-        organization = current_profile["organization"] if current_profile else "-"
+        organization_original = current_profile["organization_original"] if current_profile else "-"
 
         save_profile(
             user_id=user_id,
-            phone=text,
-            organization=organization,
+            full_name=full_name,
+            username=username,
+            phone_original=text,
+            organization_original=organization_original,
         )
+
+        profile = get_profile(user_id)
+        duplicates = get_duplicate_profiles_by_phone(profile["phone_normalized"], exclude_user_id=user_id)
 
         context.user_data.pop("reg_step", None)
 
         await update.message.reply_text("Телефон обновлён ✅")
         await show_main_menu_message(update.message)
+
+        await notify_admin_about_profile(profile, duplicates, context)
         return
 
     if mode == "edit_organization":
@@ -389,18 +638,25 @@ async def registration_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             return
 
         current_profile = get_profile(user_id)
-        phone = current_profile["phone"] if current_profile else "-"
+        phone_original = current_profile["phone_original"] if current_profile else "-"
 
         save_profile(
             user_id=user_id,
-            phone=phone,
-            organization=text,
+            full_name=full_name,
+            username=username,
+            phone_original=phone_original,
+            organization_original=text,
         )
+
+        profile = get_profile(user_id)
+        duplicates = get_duplicate_profiles_by_phone(profile["phone_normalized"], exclude_user_id=user_id)
 
         context.user_data.pop("reg_step", None)
 
         await update.message.reply_text("Организация обновлена ✅")
         await show_main_menu_message(update.message)
+
+        await notify_admin_about_profile(profile, duplicates, context)
         return
 
 
@@ -538,8 +794,8 @@ async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = (
         f"Подтверждение заказа\n\n"
-        f"Организация: {profile.get('organization', '-')}\n"
-        f"Телефон: {profile.get('phone', '-')}\n\n"
+        f"Организация: {profile.get('organization_original', '-')}\n"
+        f"Телефон: {profile.get('phone_original', '-')}\n\n"
         f"{cart_text}\n"
         f"Всего штук: {total_qty}"
     )
@@ -594,8 +850,11 @@ async def final(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id=user_id,
         full_name=full_name,
         username=username,
-        organization=profile.get("organization", "-"),
-        phone=profile.get("phone", "-"),
+        phone_original=profile["phone_original"],
+        phone_normalized=profile["phone_normalized"],
+        organization_original=profile["organization_original"],
+        organization_canonical=profile["organization_canonical"],
+        organization_status=profile["organization_status"],
         items=items,
         total_amount=total_amount,
         total_qty=total_qty,
@@ -605,11 +864,14 @@ async def final(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"НОВЫЙ ЗАКАЗ #{order_id}\n\n"
         f"Пользователь: {full_name}"
         f"{' (@' + username + ')' if username else ''}\n"
-        f"Организация: {profile.get('organization', '-')}\n"
-        f"Телефон: {profile.get('phone', '-')}\n\n"
+        f"Телефон: {profile['phone_original']}\n"
+        f"Телефон normalized: {profile['phone_normalized']}\n"
+        f"Организация original: {profile['organization_original']}\n"
+        f"Организация canonical: {profile['organization_canonical'] or '-'}\n"
+        f"Статус организации: {profile['organization_status']}\n\n"
         f"{cart_text}\n"
         f"Всего штук: {total_qty}\n"
-        f"Статус: NEW"
+        f"Статус оплаты: NEW"
     )
 
     await context.bot.send_message(
@@ -617,6 +879,17 @@ async def final(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text=admin_text,
         reply_markup=admin_order_keyboard(order_id)
     )
+
+    if profile["organization_status"] != "confirmed":
+        await notify_admin_about_pending_order(
+            order_id=order_id,
+            full_name=full_name,
+            username=username,
+            phone_original=profile["phone_original"],
+            phone_normalized=profile["phone_normalized"],
+            organization_original=profile["organization_original"],
+            context=context
+        )
 
     user_cart_store[user_id] = []
 
@@ -659,8 +932,10 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = (
         "Ваш профиль:\n\n"
-        f"Телефон: {profile_data.get('phone', '-')}\n"
-        f"Организация: {profile_data.get('organization', '-')}"
+        f"Телефон: {profile_data.get('phone_original', '-')}\n"
+        f"Организация: {profile_data.get('organization_original', '-')}\n"
+        f"Статус организации: {profile_data.get('organization_status', '-')}\n"
+        f"Подтверждённая организация: {profile_data.get('organization_canonical') or '-'}"
     )
 
     await query.edit_message_text(text, reply_markup=profile_keyboard())
@@ -695,10 +970,10 @@ async def mark_order_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     order_id = int(order_id)
 
     if action == "mark_paid":
-        update_order_status(order_id, "paid")
+        update_order_payment_status(order_id, "paid")
         new_status = "PAID"
     else:
-        update_order_status(order_id, "unpaid")
+        update_order_payment_status(order_id, "unpaid")
         new_status = "UNPAID"
 
     text = query.message.text
@@ -708,14 +983,14 @@ async def mark_order_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_found = False
 
     for line in lines:
-        if line.startswith("Статус:"):
-            updated_lines.append(f"Статус: {new_status}")
+        if line.startswith("Статус оплаты:"):
+            updated_lines.append(f"Статус оплаты: {new_status}")
             status_found = True
         else:
             updated_lines.append(line)
 
     if not status_found:
-        updated_lines.append(f"Статус: {new_status}")
+        updated_lines.append(f"Статус оплаты: {new_status}")
 
     await query.edit_message_text(
         "\n".join(updated_lines),
@@ -723,15 +998,89 @@ async def mark_order_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def report_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_USER_ID:
-        await update.message.reply_text("У вас нет доступа к этой команде.")
+async def confirm_profile_org(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != ADMIN_USER_ID:
+        await query.answer("Недостаточно прав", show_alert=True)
         return
 
-    report = get_report(days=7)
+    await query.answer()
 
+    _, user_id, canonical_org = query.data.split(":", 2)
+    set_profile_canonical_org(user_id, canonical_org)
+
+    profile = get_profile(user_id)
     text = (
-        f"ОТЧЁТ ЗА 7 ДНЕЙ\n\n"
+        "ПРОФИЛЬ ПОДТВЕРЖДЁН\n\n"
+        f"Пользователь: {profile.get('full_name') or '-'}"
+        f"{' (@' + profile.get('username') + ')' if profile.get('username') else ''}\n"
+        f"User ID: {profile['user_id']}\n"
+        f"Телефон: {profile['phone_original']}\n"
+        f"Телефон normalized: {profile['phone_normalized']}\n"
+        f"Организация original: {profile['organization_original']}\n"
+        f"Организация canonical: {profile['organization_canonical'] or '-'}\n"
+        f"Статус организации: {profile['organization_status']}\n"
+    )
+    await query.edit_message_text(text)
+
+
+async def keep_profile_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != ADMIN_USER_ID:
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+
+    await query.answer("Оставлено без подтверждения")
+
+
+async def confirm_order_org(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != ADMIN_USER_ID:
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+
+    await query.answer()
+
+    _, order_id, canonical_org = query.data.split(":", 2)
+    set_order_canonical_org(order_id, canonical_org)
+
+    text = query.message.text
+    lines = text.splitlines()
+
+    updated_lines = []
+    canonical_replaced = False
+    status_replaced = False
+
+    for line in lines:
+        if line.startswith("Организация canonical:"):
+            updated_lines.append(f"Организация canonical: {canonical_org}")
+            canonical_replaced = True
+        elif line.startswith("Статус организации:"):
+            updated_lines.append("Статус организации: confirmed")
+            status_replaced = True
+        else:
+            updated_lines.append(line)
+
+    if not canonical_replaced:
+        updated_lines.append(f"Организация canonical: {canonical_org}")
+    if not status_replaced:
+        updated_lines.append("Статус организации: confirmed")
+
+    await query.edit_message_text("\n".join(updated_lines))
+
+
+async def keep_order_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != ADMIN_USER_ID:
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+
+    await query.answer("Оставлено без подтверждения")
+
+
+def format_report_text(title, report):
+    text = (
+        f"{title}\n\n"
         f"Всего заказов: {report['total_orders']}\n"
         f"Новых: {report['new_orders']}\n"
         f"Оплачено: {report['paid_orders']}\n"
@@ -754,7 +1103,16 @@ async def report_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Оплаченная сумма: {data['paid_amount']}₾\n"
             )
 
-    await update.message.reply_text(text)
+    return text
+
+
+async def report_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("У вас нет доступа к этой команде.")
+        return
+
+    report = get_report_last_n_days(days=7)
+    await update.message.reply_text(format_report_text("ОТЧЁТ ЗА 7 ДНЕЙ", report))
 
 
 async def report_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -762,33 +1120,99 @@ async def report_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("У вас нет доступа к этой команде.")
         return
 
-    report = get_report(days=30)
+    report = get_report_last_n_days(days=30)
+    await update.message.reply_text(format_report_text("ОТЧЁТ ЗА 30 ДНЕЙ", report))
 
-    text = (
-        f"ОТЧЁТ ЗА 30 ДНЕЙ\n\n"
-        f"Всего заказов: {report['total_orders']}\n"
-        f"Новых: {report['new_orders']}\n"
-        f"Оплачено: {report['paid_orders']}\n"
-        f"Не оплачено: {report['unpaid_orders']}\n"
-        f"Оплаченная выручка: {report['paid_revenue']}₾\n\n"
-        f"ПО ОРГАНИЗАЦИЯМ:\n"
-    )
 
-    if not report["org_stats"]:
-        text += "\nНет заказов за этот период."
-    else:
-        for org, data in report["org_stats"].items():
-            text += (
-                f"\n— {org}\n"
-                f"Заказов: {data['orders']}\n"
-                f"Штук: {data['qty']}\n"
-                f"Новых: {data['new_orders']}\n"
-                f"Оплачено: {data['paid_orders']}\n"
-                f"Не оплачено: {data['unpaid_orders']}\n"
-                f"Оплаченная сумма: {data['paid_amount']}₾\n"
-            )
+async def report_last_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("У вас нет доступа к этой команде.")
+        return
 
-    await update.message.reply_text(text)
+    start_str, end_str, first_day_prev, last_day_prev = get_period_range_last_month()
+    report = get_report_by_range(start_str, end_str)
+    title = f"ОТЧЁТ ЗА ПРОШЛЫЙ МЕСЯЦ ({first_day_prev.strftime('%d.%m.%Y')} - {last_day_prev.strftime('%d.%m.%Y')})"
+    await update.message.reply_text(format_report_text(title, report))
+
+
+async def profiles_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("У вас нет доступа к этой команде.")
+        return
+
+    profiles = get_profiles()
+
+    if not profiles:
+        await update.message.reply_text("Профилей пока нет.")
+        return
+
+    chunks = []
+    current = "ЗАРЕГИСТРИРОВАННЫЕ ПРОФИЛИ\n\n"
+
+    for i, p in enumerate(profiles, start=1):
+        block = (
+            f"{i}) {p.get('full_name') or '-'}"
+            f"{' (@' + p.get('username') + ')' if p.get('username') else ''}\n"
+            f"User ID: {p['user_id']}\n"
+            f"Телефон: {p['phone_original']}\n"
+            f"Телефон normalized: {p['phone_normalized']}\n"
+            f"Организация original: {p['organization_original']}\n"
+            f"Организация canonical: {p['organization_canonical'] or '-'}\n"
+            f"Статус организации: {p['organization_status']}\n"
+            f"Создан: {p['created_at']}\n\n"
+        )
+
+        if len(current) + len(block) > 3500:
+            chunks.append(current)
+            current = block
+        else:
+            current += block
+
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
+        await update.message.reply_text(chunk)
+
+
+async def pending_profiles_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("У вас нет доступа к этой команде.")
+        return
+
+    profiles = get_pending_profiles()
+
+    if not profiles:
+        await update.message.reply_text("Нет профилей с неподтверждённой организацией.")
+        return
+
+    chunks = []
+    current = "ПРОФИЛИ БЕЗ ПОДТВЕРЖДЕНИЯ\n\n"
+
+    for i, p in enumerate(profiles, start=1):
+        block = (
+            f"{i}) {p.get('full_name') or '-'}"
+            f"{' (@' + p.get('username') + ')' if p.get('username') else ''}\n"
+            f"User ID: {p['user_id']}\n"
+            f"Телефон: {p['phone_original']}\n"
+            f"Телефон normalized: {p['phone_normalized']}\n"
+            f"Организация original: {p['organization_original']}\n"
+            f"Организация canonical: {p['organization_canonical'] or '-'}\n"
+            f"Статус организации: {p['organization_status']}\n"
+            f"Создан: {p['created_at']}\n\n"
+        )
+
+        if len(current) + len(block) > 3500:
+            chunks.append(current)
+            current = block
+        else:
+            current += block
+
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
+        await update.message.reply_text(chunk)
 
 
 async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -816,6 +1240,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("week", report_week))
     app.add_handler(CommandHandler("month", report_month))
+    app.add_handler(CommandHandler("last_month", report_last_month))
+    app.add_handler(CommandHandler("profiles", profiles_command))
+    app.add_handler(CommandHandler("pending_profiles", pending_profiles_command))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, registration_handler))
 
@@ -830,6 +1257,10 @@ def main():
     app.add_handler(CallbackQueryHandler(edit_phone, pattern=r"^edit_phone$"))
     app.add_handler(CallbackQueryHandler(edit_organization, pattern=r"^edit_organization$"))
     app.add_handler(CallbackQueryHandler(mark_order_status, pattern=r"^(mark_paid|mark_unpaid):"))
+    app.add_handler(CallbackQueryHandler(confirm_profile_org, pattern=r"^confirm_profile_org:"))
+    app.add_handler(CallbackQueryHandler(keep_profile_pending, pattern=r"^keep_profile_pending:"))
+    app.add_handler(CallbackQueryHandler(confirm_order_org, pattern=r"^confirm_order_org:"))
+    app.add_handler(CallbackQueryHandler(keep_order_pending, pattern=r"^keep_order_pending:"))
     app.add_handler(CallbackQueryHandler(back_main, pattern=r"^back_main$"))
     app.add_handler(CallbackQueryHandler(cancel, pattern=r"^cancel$"))
 
