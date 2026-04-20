@@ -390,6 +390,23 @@ def get_pending_profiles(limit=200):
     return [dict(r) for r in rows]
 
 
+def get_unpaid_orders(limit=200):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT *
+        FROM orders
+        WHERE payment_status IN ('new', 'unpaid')
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (limit,))
+
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def get_period_range_last_month():
     today = date.today()
     first_day_current_month = date(today.year, today.month, 1)
@@ -490,6 +507,7 @@ async def set_commands(application):
                 BotCommand("last_month", "Отчёт за прошлый месяц"),
                 BotCommand("profiles", "Все профили"),
                 BotCommand("pending_profiles", "Профили без подтверждения"),
+                BotCommand("unpaid", "Неоплаченные заказы"),
             ],
             scope=BotCommandScopeChat(chat_id=admin_id)
         )
@@ -1219,6 +1237,56 @@ async def pending_profiles_command(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(chunk)
 
 
+async def unpaid_orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_USER_IDS:
+        await update.message.reply_text("У вас нет доступа к этой команде.")
+        return
+
+    orders = get_unpaid_orders()
+
+    if not orders:
+        await update.message.reply_text("Неоплаченных заказов нет.")
+        return
+
+    total_amount = sum(order["total_amount"] for order in orders)
+    total_qty = sum(order["total_qty"] for order in orders)
+
+    chunks = []
+    current = (
+        "НЕОПЛАЧЕННЫЕ ЗАКАЗЫ\n\n"
+        f"Всего заказов: {len(orders)}\n"
+        f"Общая сумма: {total_amount}₾\n"
+        f"Всего штук: {total_qty}\n\n"
+    )
+
+    for order in orders:
+        block = (
+            f"Заказ #{order['id']}\n"
+            f"Дата: {order['created_at']}\n"
+            f"Пользователь: {order.get('full_name') or '-'}"
+            f"{' (@' + order.get('username') + ')' if order.get('username') else ''}\n"
+            f"Телефон: {order['phone_original']}\n"
+            f"Организация original: {order['organization_original']}\n"
+            f"Организация canonical: {order['organization_canonical'] or '-'}\n"
+            f"Статус организации: {order['organization_status']}\n"
+            f"Сумма: {order['total_amount']}₾\n"
+            f"Штук: {order['total_qty']}\n"
+            f"Статус оплаты: {order['payment_status'].upper()}\n\n"
+        )
+
+        if len(current) + len(block) > 3500:
+            chunks.append(current)
+            current = block
+        else:
+            current += block
+
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
+        await update.message.reply_text(chunk)
+
+
 async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1247,6 +1315,7 @@ def main():
     app.add_handler(CommandHandler("last_month", report_last_month))
     app.add_handler(CommandHandler("profiles", profiles_command))
     app.add_handler(CommandHandler("pending_profiles", pending_profiles_command))
+    app.add_handler(CommandHandler("unpaid", unpaid_orders_command))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, registration_handler))
 
@@ -1275,4 +1344,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
