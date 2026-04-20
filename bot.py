@@ -3,6 +3,7 @@ import os
 import re
 import sqlite3
 from datetime import datetime, timedelta, date
+from html import escape
 
 from telegram import (
     InlineKeyboardButton,
@@ -11,6 +12,9 @@ from telegram import (
     BotCommand,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeChat,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -21,7 +25,7 @@ from telegram.ext import (
     filters,
 )
 
-TOKEN = "8633256261:AAHBNFW5BzGsLLAHHRhy4I1HJJixD5759cM"
+TOKEN = os.getenv("BOT_TOKEN", "")
 
 ADMIN_USER_IDS = {80263589, 374698952}
 
@@ -70,6 +74,10 @@ def get_connection():
     return conn
 
 
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_USER_IDS
+
+
 def normalize_phone(phone: str) -> str:
     phone = phone.strip()
     if phone.startswith("+"):
@@ -90,6 +98,12 @@ def normalize_org_text(text: str) -> str:
     value = re.sub(r"[\"'`.,;:!?(){}\[\]/\\]+", " ", value)
     value = re.sub(r"\s+", " ", value).strip()
     return value
+
+
+def get_effective_org_name(canonical, status):
+    if status == "confirmed" and canonical:
+        return canonical
+    return "⏳ Неподтверждённые"
 
 
 def get_total_qty(items):
@@ -128,6 +142,14 @@ def profile_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
+def contact_request_keyboard():
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("📱 Поделиться номером", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
 def admin_order_keyboard(order_id):
     return InlineKeyboardMarkup([
         [
@@ -151,6 +173,15 @@ def admin_order_confirm_keyboard(order_id):
         rows.append([InlineKeyboardButton(org, callback_data=f"confirm_order_org:{order_id}:{org}")])
     rows.append([InlineKeyboardButton("⏳ Оставить без подтверждения", callback_data=f"keep_order_pending:{order_id}")])
     return InlineKeyboardMarkup(rows)
+
+
+def build_user_link_html(user_id, full_name):
+    safe_name = escape(full_name or "Пользователь")
+    return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
+
+
+def build_username_text(username):
+    return f"@{username}" if username else "-"
 
 
 def init_db():
@@ -195,6 +226,16 @@ def init_db():
     conn.close()
 
 
+def get_profile(user_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT * FROM profiles WHERE user_id = ?", (str(user_id),))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 def save_profile(user_id, full_name, username, phone_original, organization_original):
     conn = get_connection()
     cursor = conn.cursor()
@@ -205,8 +246,15 @@ def save_profile(user_id, full_name, username, phone_original, organization_orig
     existing = get_profile(user_id)
 
     if existing:
-        organization_canonical = existing["organization_canonical"]
-        organization_status = existing["organization_status"]
+        old_org_normalized = normalize_org_text(existing["organization_original"])
+        new_org_normalized = normalize_org_text(organization_original)
+
+        if old_org_normalized == new_org_normalized:
+            organization_canonical = existing["organization_canonical"]
+            organization_status = existing["organization_status"]
+        else:
+            organization_canonical = None
+            organization_status = "pending"
     else:
         organization_canonical = None
         organization_status = "pending"
@@ -225,6 +273,8 @@ def save_profile(user_id, full_name, username, phone_original, organization_orig
             phone_original = excluded.phone_original,
             phone_normalized = excluded.phone_normalized,
             organization_original = excluded.organization_original,
+            organization_canonical = excluded.organization_canonical,
+            organization_status = excluded.organization_status,
             updated_at = excluded.updated_at
     """, (
         str(user_id),
@@ -241,16 +291,6 @@ def save_profile(user_id, full_name, username, phone_original, organization_orig
 
     conn.commit()
     conn.close()
-
-
-def get_profile(user_id):
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT * FROM profiles WHERE user_id = ?", (str(user_id),))
-    row = cursor.fetchone()
-    conn.close()
-    return dict(row) if row else None
 
 
 def get_duplicate_profiles_by_phone(phone_normalized, exclude_user_id=None):
@@ -441,7 +481,8 @@ def get_report_by_range(start_date_str, end_date_str):
 
     org_stats = {}
     for r in rows:
-        org = r["organization_canonical"] if r["organization_canonical"] else "⏳ Неподтверждённые"
+        org = get_effective_org_name(r["organization_canonical"], r["organization_status"])
+
         if org not in org_stats:
             org_stats[org] = {
                 "orders": 0,
@@ -514,43 +555,49 @@ async def set_commands(application):
 
 
 async def notify_admin_about_profile(profile, duplicates, context: ContextTypes.DEFAULT_TYPE):
+    user_link = build_user_link_html(profile["user_id"], profile.get("full_name") or "Пользователь")
+
     text = (
         "НОВЫЙ / ОБНОВЛЁННЫЙ ПРОФИЛЬ\n\n"
-        f"Пользователь: {profile.get('full_name') or '-'}"
-        f"{' (@' + profile.get('username') + ')' if profile.get('username') else ''}\n"
+        f"Пользователь: {user_link}\n"
+        f"Username: {escape(build_username_text(profile.get('username')))}\n"
         f"User ID: {profile['user_id']}\n"
-        f"Телефон: {profile['phone_original']}\n"
-        f"Телефон normalized: {profile['phone_normalized']}\n"
-        f"Организация original: {profile['organization_original']}\n"
-        f"Организация canonical: {profile['organization_canonical'] or '-'}\n"
-        f"Статус организации: {profile['organization_status']}\n"
+        f"Телефон: {escape(profile['phone_original'])}\n"
+        f"Телефон normalized: {escape(profile['phone_normalized'])}\n"
+        f"Организация original: {escape(profile['organization_original'])}\n"
+        f"Организация canonical: {escape(profile['organization_canonical'] or '-')}\n"
+        f"Статус организации: {escape(profile['organization_status'])}\n"
     )
 
     if duplicates:
         text += "\n⚠️ Найдены дубли по номеру:\n"
         for d in duplicates[:10]:
             text += (
-                f"- {d.get('full_name') or '-'}"
-                f"{' (@' + d.get('username') + ')' if d.get('username') else ''}, "
-                f"user_id={d['user_id']}, org={d['organization_original']}\n"
+                f"- {escape(d.get('full_name') or '-')}, "
+                f"{escape(build_username_text(d.get('username')))}, "
+                f"user_id={d['user_id']}, org={escape(d['organization_original'])}\n"
             )
 
     for admin_id in ADMIN_USER_IDS:
         await context.bot.send_message(
             chat_id=admin_id,
             text=text,
+            parse_mode="HTML",
             reply_markup=admin_profile_confirm_keyboard(profile["user_id"])
         )
 
 
-async def notify_admin_about_pending_order(order_id, full_name, username, phone_original, phone_normalized, organization_original, context):
+async def notify_admin_about_pending_order(order_id, full_name, username, phone_original, phone_normalized, organization_original, user_id, context):
+    user_link = build_user_link_html(user_id, full_name or "Пользователь")
+
     text = (
         f"ЗАКАЗ #{order_id} ТРЕБУЕТ ПОДТВЕРЖДЕНИЯ ОРГАНИЗАЦИИ\n\n"
-        f"Пользователь: {full_name}"
-        f"{' (@' + username + ')' if username else ''}\n"
-        f"Телефон: {phone_original}\n"
-        f"Телефон normalized: {phone_normalized}\n"
-        f"Организация original: {organization_original}\n"
+        f"Пользователь: {user_link}\n"
+        f"Username: {escape(build_username_text(username))}\n"
+        f"User ID: {user_id}\n"
+        f"Телефон: {escape(phone_original)}\n"
+        f"Телефон normalized: {escape(phone_normalized)}\n"
+        f"Организация original: {escape(organization_original)}\n"
         f"Статус организации: pending"
     )
 
@@ -558,6 +605,7 @@ async def notify_admin_about_pending_order(order_id, full_name, username, phone_
         await context.bot.send_message(
             chat_id=admin_id,
             text=text,
+            parse_mode="HTML",
             reply_markup=admin_order_confirm_keyboard(order_id)
         )
 
@@ -570,7 +618,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["reg_step"] = "phone"
         await update.message.reply_text(
             "Добро пожаловать.\n"
-            "Для регистрации введите номер телефона:"
+            "Нажмите кнопку ниже, чтобы поделиться номером телефона для доставки:",
+            reply_markup=contact_request_keyboard()
         )
         return
 
@@ -585,19 +634,43 @@ async def registration_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = str(update.effective_user.id)
     full_name = update.effective_user.full_name
     username = update.effective_user.username or ""
-    text = update.message.text.strip()
 
     if mode == "phone":
-        if not is_valid_phone(text):
+        phone_text = None
+
+        if update.message.contact:
+            # Разрешаем принять только контакт самого пользователя
+            if update.message.contact.user_id and str(update.message.contact.user_id) != user_id:
+                await update.message.reply_text(
+                    "Пожалуйста, поделитесь своим номером через кнопку ниже.",
+                    reply_markup=contact_request_keyboard()
+                )
+                return
+            phone_text = update.message.contact.phone_number
+        elif update.message.text:
+            phone_text = update.message.text.strip()
+
+        if not phone_text or not is_valid_phone(phone_text):
             await update.message.reply_text(
-                "Номер телефона введён некорректно.\nВведите номер ещё раз:"
+                "Номер телефона введён некорректно.\n"
+                "Нажмите кнопку «Поделиться номером» или введите номер ещё раз:",
+                reply_markup=contact_request_keyboard()
             )
             return
 
-        context.user_data["phone_original"] = text
+        context.user_data["phone_original"] = phone_text
         context.user_data["reg_step"] = "organization"
-        await update.message.reply_text("Теперь введите организацию:")
+        await update.message.reply_text(
+            "Теперь введите организацию:",
+            reply_markup=ReplyKeyboardRemove()
+        )
         return
+
+    if not update.message.text:
+        await update.message.reply_text("Пожалуйста, отправьте текстом нужное значение.")
+        return
+
+    text = update.message.text.strip()
 
     if mode == "organization":
         if not text:
@@ -618,7 +691,7 @@ async def registration_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.pop("reg_step", None)
         context.user_data.pop("phone_original", None)
 
-        await update.message.reply_text("Регистрация завершена ✅")
+        await update.message.reply_text("Регистрация завершена ✅", reply_markup=ReplyKeyboardRemove())
         await show_main_menu_message(update.message)
 
         await notify_admin_about_profile(profile, duplicates, context)
@@ -816,7 +889,7 @@ async def checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"Подтверждение заказа\n\n"
         f"Организация: {profile.get('organization_original', '-')}\n"
-        f"Телефон: {profile.get('phone_original', '-')}\n\n"
+        f"Телефон для доставки: {profile.get('phone_original', '-')}\n\n"
         f"{cart_text}\n"
         f"Всего штук: {total_qty}"
     )
@@ -881,16 +954,19 @@ async def final(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_qty=total_qty,
     )
 
+    user_link = build_user_link_html(user_id, full_name or "Пользователь")
+
     admin_text = (
         f"НОВЫЙ ЗАКАЗ #{order_id}\n\n"
-        f"Пользователь: {full_name}"
-        f"{' (@' + username + ')' if username else ''}\n"
-        f"Телефон: {profile['phone_original']}\n"
-        f"Телефон normalized: {profile['phone_normalized']}\n"
-        f"Организация original: {profile['organization_original']}\n"
-        f"Организация canonical: {profile['organization_canonical'] or '-'}\n"
-        f"Статус организации: {profile['organization_status']}\n\n"
-        f"{cart_text}\n"
+        f"Пользователь: {user_link}\n"
+        f"Username: {escape(build_username_text(username))}\n"
+        f"User ID: {user_id}\n"
+        f"Телефон для доставки: {escape(profile['phone_original'])}\n"
+        f"Телефон normalized: {escape(profile['phone_normalized'])}\n"
+        f"Организация original: {escape(profile['organization_original'])}\n"
+        f"Организация canonical: {escape(profile['organization_canonical'] or '-')}\n"
+        f"Статус организации: {escape(profile['organization_status'])}\n\n"
+        f"{escape(cart_text)}\n"
         f"Всего штук: {total_qty}\n"
         f"Статус оплаты: NEW"
     )
@@ -899,6 +975,7 @@ async def final(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=admin_id,
             text=admin_text,
+            parse_mode="HTML",
             reply_markup=admin_order_keyboard(order_id)
         )
 
@@ -910,6 +987,7 @@ async def final(update: Update, context: ContextTypes.DEFAULT_TYPE):
             phone_original=profile["phone_original"],
             phone_normalized=profile["phone_normalized"],
             organization_original=profile["organization_original"],
+            user_id=user_id,
             context=context
         )
 
@@ -954,7 +1032,7 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = (
         "Ваш профиль:\n\n"
-        f"Телефон: {profile_data.get('phone_original', '-')}\n"
+        f"Телефон для доставки: {profile_data.get('phone_original', '-')}\n"
         f"Организация: {profile_data.get('organization_original', '-')}\n"
         f"Статус организации: {profile_data.get('organization_status', '-')}\n"
         f"Подтверждённая организация: {profile_data.get('organization_canonical') or '-'}"
@@ -968,7 +1046,7 @@ async def edit_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     context.user_data["reg_step"] = "edit_phone"
-    await query.edit_message_text("Введите новый номер телефона:")
+    await query.edit_message_text("Введите новый номер телефона для доставки:")
 
 
 async def edit_organization(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -982,7 +1060,7 @@ async def edit_organization(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def mark_order_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
 
-    if query.from_user.id not in ADMIN_USER_IDS:
+    if not is_admin(query.from_user.id):
         await query.answer("Недостаточно прав", show_alert=True)
         return
 
@@ -1016,13 +1094,14 @@ async def mark_order_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_text(
         "\n".join(updated_lines),
+        parse_mode="HTML",
         reply_markup=admin_order_keyboard(order_id)
     )
 
 
 async def confirm_profile_org(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id not in ADMIN_USER_IDS:
+    if not is_admin(query.from_user.id):
         await query.answer("Недостаточно прав", show_alert=True)
         return
 
@@ -1032,23 +1111,25 @@ async def confirm_profile_org(update: Update, context: ContextTypes.DEFAULT_TYPE
     set_profile_canonical_org(user_id, canonical_org)
 
     profile = get_profile(user_id)
+    user_link = build_user_link_html(profile["user_id"], profile.get("full_name") or "Пользователь")
+
     text = (
         "ПРОФИЛЬ ПОДТВЕРЖДЁН\n\n"
-        f"Пользователь: {profile.get('full_name') or '-'}"
-        f"{' (@' + profile.get('username') + ')' if profile.get('username') else ''}\n"
+        f"Пользователь: {user_link}\n"
+        f"Username: {escape(build_username_text(profile.get('username')))}\n"
         f"User ID: {profile['user_id']}\n"
-        f"Телефон: {profile['phone_original']}\n"
-        f"Телефон normalized: {profile['phone_normalized']}\n"
-        f"Организация original: {profile['organization_original']}\n"
-        f"Организация canonical: {profile['organization_canonical'] or '-'}\n"
-        f"Статус организации: {profile['organization_status']}\n"
+        f"Телефон: {escape(profile['phone_original'])}\n"
+        f"Телефон normalized: {escape(profile['phone_normalized'])}\n"
+        f"Организация original: {escape(profile['organization_original'])}\n"
+        f"Организация canonical: {escape(profile['organization_canonical'] or '-')}\n"
+        f"Статус организации: {escape(profile['organization_status'])}\n"
     )
-    await query.edit_message_text(text)
+    await query.edit_message_text(text, parse_mode="HTML")
 
 
 async def keep_profile_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id not in ADMIN_USER_IDS:
+    if not is_admin(query.from_user.id):
         await query.answer("Недостаточно прав", show_alert=True)
         return
 
@@ -1057,7 +1138,7 @@ async def keep_profile_pending(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def confirm_order_org(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id not in ADMIN_USER_IDS:
+    if not is_admin(query.from_user.id):
         await query.answer("Недостаточно прав", show_alert=True)
         return
 
@@ -1088,12 +1169,12 @@ async def confirm_order_org(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not status_replaced:
         updated_lines.append("Статус организации: confirmed")
 
-    await query.edit_message_text("\n".join(updated_lines))
+    await query.edit_message_text("\n".join(updated_lines), parse_mode="HTML")
 
 
 async def keep_order_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id not in ADMIN_USER_IDS:
+    if not is_admin(query.from_user.id):
         await query.answer("Недостаточно прав", show_alert=True)
         return
 
@@ -1128,8 +1209,42 @@ def format_report_text(title, report):
     return text
 
 
+def build_profile_card_text(profile):
+    user_link = build_user_link_html(profile["user_id"], profile.get("full_name") or "Пользователь")
+    return (
+        "ПРОФИЛЬ БЕЗ ПОДТВЕРЖДЕНИЯ\n\n"
+        f"Пользователь: {user_link}\n"
+        f"Username: {escape(build_username_text(profile.get('username')))}\n"
+        f"User ID: {profile['user_id']}\n"
+        f"Телефон: {escape(profile['phone_original'])}\n"
+        f"Телефон normalized: {escape(profile['phone_normalized'])}\n"
+        f"Организация original: {escape(profile['organization_original'])}\n"
+        f"Организация canonical: {escape(profile['organization_canonical'] or '-')}\n"
+        f"Статус организации: {escape(profile['organization_status'])}\n"
+        f"Создан: {escape(profile['created_at'])}"
+    )
+
+
+def build_unpaid_order_card_text(order):
+    user_link = build_user_link_html(order["user_id"], order.get("full_name") or "Пользователь")
+    return (
+        f"НЕОПЛАЧЕННЫЙ ЗАКАЗ #{order['id']}\n\n"
+        f"Пользователь: {user_link}\n"
+        f"Username: {escape(build_username_text(order.get('username')))}\n"
+        f"User ID: {order['user_id']}\n"
+        f"Телефон для доставки: {escape(order['phone_original'])}\n"
+        f"Организация original: {escape(order['organization_original'])}\n"
+        f"Организация canonical: {escape(order['organization_canonical'] or '-')}\n"
+        f"Статус организации: {escape(order['organization_status'])}\n"
+        f"Дата: {escape(order['created_at'])}\n"
+        f"Сумма: {order['total_amount']}₾\n"
+        f"Штук: {order['total_qty']}\n"
+        f"Статус оплаты: {escape(order['payment_status'].upper())}"
+    )
+
+
 async def report_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_USER_IDS:
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text("У вас нет доступа к этой команде.")
         return
 
@@ -1138,7 +1253,7 @@ async def report_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def report_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_USER_IDS:
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text("У вас нет доступа к этой команде.")
         return
 
@@ -1147,7 +1262,7 @@ async def report_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def report_last_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_USER_IDS:
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text("У вас нет доступа к этой команде.")
         return
 
@@ -1158,7 +1273,7 @@ async def report_last_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def profiles_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_USER_IDS:
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text("У вас нет доступа к этой команде.")
         return
 
@@ -1198,7 +1313,7 @@ async def profiles_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def pending_profiles_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_USER_IDS:
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text("У вас нет доступа к этой команде.")
         return
 
@@ -1208,37 +1323,18 @@ async def pending_profiles_command(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("Нет профилей с неподтверждённой организацией.")
         return
 
-    chunks = []
-    current = "ПРОФИЛИ БЕЗ ПОДТВЕРЖДЕНИЯ\n\n"
+    await update.message.reply_text(f"Найдено профилей без подтверждения: {len(profiles)}")
 
-    for i, p in enumerate(profiles, start=1):
-        block = (
-            f"{i}) {p.get('full_name') or '-'}"
-            f"{' (@' + p.get('username') + ')' if p.get('username') else ''}\n"
-            f"User ID: {p['user_id']}\n"
-            f"Телефон: {p['phone_original']}\n"
-            f"Телефон normalized: {p['phone_normalized']}\n"
-            f"Организация original: {p['organization_original']}\n"
-            f"Организация canonical: {p['organization_canonical'] or '-'}\n"
-            f"Статус организации: {p['organization_status']}\n"
-            f"Создан: {p['created_at']}\n\n"
+    for profile in profiles:
+        await update.message.reply_text(
+            build_profile_card_text(profile),
+            parse_mode="HTML",
+            reply_markup=admin_profile_confirm_keyboard(profile["user_id"])
         )
-
-        if len(current) + len(block) > 3500:
-            chunks.append(current)
-            current = block
-        else:
-            current += block
-
-    if current:
-        chunks.append(current)
-
-    for chunk in chunks:
-        await update.message.reply_text(chunk)
 
 
 async def unpaid_orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_USER_IDS:
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text("У вас нет доступа к этой команде.")
         return
 
@@ -1251,40 +1347,25 @@ async def unpaid_orders_command(update: Update, context: ContextTypes.DEFAULT_TY
     total_amount = sum(order["total_amount"] for order in orders)
     total_qty = sum(order["total_qty"] for order in orders)
 
-    chunks = []
-    current = (
+    await update.message.reply_text(
         "НЕОПЛАЧЕННЫЕ ЗАКАЗЫ\n\n"
         f"Всего заказов: {len(orders)}\n"
         f"Общая сумма: {total_amount}₾\n"
-        f"Всего штук: {total_qty}\n\n"
+        f"Всего штук: {total_qty}"
     )
 
     for order in orders:
-        block = (
-            f"Заказ #{order['id']}\n"
-            f"Дата: {order['created_at']}\n"
-            f"Пользователь: {order.get('full_name') or '-'}"
-            f"{' (@' + order.get('username') + ')' if order.get('username') else ''}\n"
-            f"Телефон: {order['phone_original']}\n"
-            f"Организация original: {order['organization_original']}\n"
-            f"Организация canonical: {order['organization_canonical'] or '-'}\n"
-            f"Статус организации: {order['organization_status']}\n"
-            f"Сумма: {order['total_amount']}₾\n"
-            f"Штук: {order['total_qty']}\n"
-            f"Статус оплаты: {order['payment_status'].upper()}\n\n"
+        await update.message.reply_text(
+            build_unpaid_order_card_text(order),
+            parse_mode="HTML",
+            reply_markup=admin_order_keyboard(order["id"])
         )
 
-        if len(current) + len(block) > 3500:
-            chunks.append(current)
-            current = block
-        else:
-            current += block
-
-    if current:
-        chunks.append(current)
-
-    for chunk in chunks:
-        await update.message.reply_text(chunk)
+        if order["organization_status"] != "confirmed":
+            await update.message.reply_text(
+                f"Подтвердить организацию для заказа #{order['id']}:",
+                reply_markup=admin_order_confirm_keyboard(order["id"])
+            )
 
 
 async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1305,6 +1386,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    if not TOKEN:
+        raise ValueError("BOT_TOKEN не задан в переменных окружения Railway")
+
     init_db()
 
     app = ApplicationBuilder().token(TOKEN).post_init(set_commands).build()
@@ -1317,7 +1401,7 @@ def main():
     app.add_handler(CommandHandler("pending_profiles", pending_profiles_command))
     app.add_handler(CommandHandler("unpaid", unpaid_orders_command))
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, registration_handler))
+    app.add_handler(MessageHandler((filters.TEXT | filters.CONTACT) & ~filters.COMMAND, registration_handler))
 
     app.add_handler(CallbackQueryHandler(category, pattern=r"^cat:"))
     app.add_handler(CallbackQueryHandler(item, pattern=r"^item:"))
