@@ -1233,6 +1233,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    if os.path.exists(DB_FILE):
+        os.remove(DB_FILE)
     init_db()
 
     app = ApplicationBuilder().token(TOKEN).post_init(set_commands).build()
