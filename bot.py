@@ -160,7 +160,16 @@ def contact_request_keyboard():
 def admin_order_keyboard(order_id):
     return kb([btn("✅ Оплачен", f"mark_paid:{order_id}"), btn("❌ Не оплачен", f"mark_unpaid:{order_id}")])
 
-def org_confirm_keyboard(prefix, entity_id, viewer_user_id=None):
+def profile_actions_keyboard(profile_user_id, viewer_user_id):
+    rows = [[btn(org, f"confirm_profile_org:{profile_user_id}:{org}")] for org in CANONICAL_ORGANIZATIONS]
+    rows.append([btn("⏳ Оставить без подтверждения", f"keep_profile_pending:{profile_user_id}")])
+
+    if is_alexander(viewer_user_id):
+        rows.append([btn("🗑 Удалить профиль", f"delete_profile_confirm:{profile_user_id}")])
+
+    return InlineKeyboardMarkup(rows)
+
+def org_confirm_keyboard(prefix, entity_id):
     rows = [[btn(org, f"{prefix}:{entity_id}:{org}")] for org in CANONICAL_ORGANIZATIONS]
     rows.append([
         btn(
@@ -168,10 +177,6 @@ def org_confirm_keyboard(prefix, entity_id, viewer_user_id=None):
             f"keep_profile_pending:{entity_id}" if "profile" in prefix else f"keep_order_pending:{entity_id}"
         )
     ])
-
-    if "profile" in prefix and viewer_user_id is not None and is_alexander(viewer_user_id):
-        rows.append([btn("🗑 Удалить профиль", f"delete_profile_confirm:{entity_id}")])
-
     return InlineKeyboardMarkup(rows)
 
 def delete_profile_confirm_keyboard(uid):
@@ -225,6 +230,12 @@ def set_profile_canonical_org(uid, canonical_org):
     db_execute(
         "UPDATE profiles SET organization_canonical=?, organization_status='confirmed', updated_at=? WHERE user_id=?",
         (canonical_org, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), str(uid))
+    )
+
+def set_profile_pending_org(uid):
+    db_execute(
+        "UPDATE profiles SET organization_canonical=NULL, organization_status='pending', updated_at=? WHERE user_id=?",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), str(uid))
     )
 
 def delete_profile_by_user_id(uid):
@@ -326,13 +337,19 @@ def format_report_text(title, report):
 
 # ─── Card builders ────────────────────────────────────────────────────────────
 
-def build_profile_card_text(p, header="ПРОФИЛЬ БЕЗ ПОДТВЕРЖДЕНИЯ"):
-    return (f"{header}\n\nПользователь: {user_link(p['user_id'], p.get('full_name'))}\n"
-            f"Username: {escape(fmt_username(p.get('username')))}\nUser ID: {p['user_id']}\n"
-            f"Телефон: {escape(p['phone_original'])}\nТелефон normalized: {escape(p['phone_normalized'])}\n"
-            f"Организация original: {escape(p['organization_original'])}\n"
-            f"Организация canonical: {escape(p['organization_canonical'] or '-')}\n"
-            f"Статус организации: {escape(p['organization_status'])}\nСоздан: {escape(p['created_at'])}")
+def build_profile_card_text(p, header="ПРОФИЛЬ"):
+    return (
+        f"{header}\n\n"
+        f"Пользователь: {user_link(p['user_id'], p.get('full_name'))}\n"
+        f"Username: {escape(fmt_username(p.get('username')))}\n"
+        f"User ID: {p['user_id']}\n"
+        f"Телефон: {escape(p['phone_original'])}\n"
+        f"Телефон normalized: {escape(p['phone_normalized'])}\n"
+        f"Организация original: {escape(p['organization_original'])}\n"
+        f"Организация canonical: {escape(p['organization_canonical'] or '-')}\n"
+        f"Статус организации: {escape(p['organization_status'])}\n"
+        f"Создан: {escape(p['created_at'])}"
+    )
 
 def build_unpaid_order_card_text(o):
     return (f"НЕОПЛАЧЕННЫЙ ЗАКАЗ #{o['id']}\n\nПользователь: {user_link(o['user_id'], o.get('full_name'))}\n"
@@ -368,7 +385,7 @@ async def notify_admin_about_profile(profile, duplicates, context):
             chat_id=aid,
             text=text,
             parse_mode="HTML",
-            reply_markup=org_confirm_keyboard("confirm_profile_org", profile["user_id"], viewer_user_id=aid)
+            reply_markup=profile_actions_keyboard(profile["user_id"], aid)
         )
 
 async def notify_admin_about_pending_order(order_id, profile, uid, context):
@@ -681,18 +698,50 @@ async def confirm_profile_org(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not is_admin(query.from_user.id):
         await query.answer("Недостаточно прав", show_alert=True)
         return
+
     await query.answer()
+
     _, uid, canonical_org = query.data.split(":", 2)
     set_profile_canonical_org(uid, canonical_org)
     p = get_profile(uid)
-    await query.edit_message_text(build_profile_card_text(p, "ПРОФИЛЬ ПОДТВЕРЖДЁН"), parse_mode="HTML")
+
+    if not p:
+        await query.edit_message_text("Профиль не найден.")
+        return
+
+    await query.edit_message_text(
+        build_profile_card_text(p, header="ПРОФИЛЬ"),
+        parse_mode="HTML",
+        reply_markup=profile_actions_keyboard(
+            profile_user_id=p["user_id"],
+            viewer_user_id=query.from_user.id
+        )
+    )
 
 async def keep_profile_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not is_admin(query.from_user.id):
         await query.answer("Недостаточно прав", show_alert=True)
         return
+
     await query.answer("Оставлено без подтверждения")
+
+    _, uid = query.data.split(":", 1)
+    set_profile_pending_org(uid)
+    p = get_profile(uid)
+
+    if not p:
+        await query.edit_message_text("Профиль не найден.")
+        return
+
+    await query.edit_message_text(
+        build_profile_card_text(p, header="ПРОФИЛЬ"),
+        parse_mode="HTML",
+        reply_markup=profile_actions_keyboard(
+            profile_user_id=p["user_id"],
+            viewer_user_id=query.from_user.id
+        )
+    )
 
 async def delete_profile_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -735,9 +784,12 @@ async def delete_profile_cancel(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("Профиль не найден.")
         return
     await query.edit_message_text(
-        build_profile_card_text(p),
+        build_profile_card_text(p, header="ПРОФИЛЬ"),
         parse_mode="HTML",
-        reply_markup=org_confirm_keyboard("confirm_profile_org", p["user_id"], viewer_user_id=query.from_user.id)
+        reply_markup=profile_actions_keyboard(
+            profile_user_id=p["user_id"],
+            viewer_user_id=query.from_user.id
+        )
     )
 
 async def confirm_order_org(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -812,24 +864,18 @@ async def profiles_command(update, context):
     if not profiles:
         await update.message.reply_text("Профилей пока нет.")
         return
-    chunks, current = [], f"ЗАРЕГИСТРИРОВАННЫЕ ПРОФИЛИ\n\n"
-    for i, p in enumerate(profiles, 1):
-        block = (f"{i}) {p.get('full_name') or '-'}"
-                 f"{' (@' + p.get('username') + ')' if p.get('username') else ''}\n"
-                 f"User ID: {p['user_id']}\nТелефон: {p['phone_original']}\n"
-                 f"Телефон normalized: {p['phone_normalized']}\n"
-                 f"Организация original: {p['organization_original']}\n"
-                 f"Организация canonical: {p['organization_canonical'] or '-'}\n"
-                 f"Статус организации: {p['organization_status']}\nСоздан: {p['created_at']}\n\n")
-        if len(current) + len(block) > 3500:
-            chunks.append(current)
-            current = block
-        else:
-            current += block
-    if current:
-        chunks.append(current)
-    for chunk in chunks:
-        await update.message.reply_text(chunk)
+
+    await update.message.reply_text(f"Всего профилей: {len(profiles)}")
+
+    for p in profiles:
+        await update.message.reply_text(
+            build_profile_card_text(p, header="ПРОФИЛЬ"),
+            parse_mode="HTML",
+            reply_markup=profile_actions_keyboard(
+                profile_user_id=p["user_id"],
+                viewer_user_id=update.effective_user.id
+            )
+        )
 
 @admin_only
 async def pending_profiles_command(update, context):
@@ -840,9 +886,12 @@ async def pending_profiles_command(update, context):
     await update.message.reply_text(f"Найдено профилей без подтверждения: {len(profiles)}")
     for p in profiles:
         await update.message.reply_text(
-            build_profile_card_text(p),
+            build_profile_card_text(p, header="ПРОФИЛЬ"),
             parse_mode="HTML",
-            reply_markup=org_confirm_keyboard("confirm_profile_org", p["user_id"], viewer_user_id=update.effective_user.id)
+            reply_markup=profile_actions_keyboard(
+                profile_user_id=p["user_id"],
+                viewer_user_id=update.effective_user.id
+            )
         )
 
 @admin_only
