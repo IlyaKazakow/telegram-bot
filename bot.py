@@ -131,6 +131,11 @@ def user_link(uid, name):
 def fmt_username(u):
     return f"@{u}" if u else "-"
 
+def profile_button_label(profile_data):
+    name = profile_data.get("full_name") or "Без имени"
+    status_icon = "🟢" if profile_data.get("organization_status") == "confirmed" else "🟡"
+    return f"{status_icon} {name}"
+
 # ─── Keyboards ────────────────────────────────────────────────────────────────
 
 def kb(*rows):
@@ -160,13 +165,14 @@ def contact_request_keyboard():
 def admin_order_keyboard(order_id):
     return kb([btn("✅ Оплачен", f"mark_paid:{order_id}"), btn("❌ Не оплачен", f"mark_unpaid:{order_id}")])
 
-def profile_actions_keyboard(profile_user_id, viewer_user_id):
+def profile_actions_keyboard(profile_user_id, viewer_user_id, back_target="profiles_list"):
     rows = [[btn(org, f"confirm_profile_org:{profile_user_id}:{org}")] for org in CANONICAL_ORGANIZATIONS]
     rows.append([btn("⏳ Оставить без подтверждения", f"keep_profile_pending:{profile_user_id}")])
 
     if is_alexander(viewer_user_id):
         rows.append([btn("🗑 Удалить профиль", f"delete_profile_confirm:{profile_user_id}")])
 
+    rows.append([btn("🔙 Назад к списку", back_target)])
     return InlineKeyboardMarkup(rows)
 
 def org_confirm_keyboard(prefix, entity_id):
@@ -190,6 +196,16 @@ def pending_org_block_keyboard():
         [btn("⚙️ Профиль", "profile")],
         [btn("🏠 В меню", "back_main")],
     )
+
+def profiles_list_keyboard(profiles, viewer_user_id):
+    rows = [[btn(profile_button_label(p), f"open_profile:{p['user_id']}")] for p in profiles]
+    rows.append([btn("🏠 В меню", "back_main")])
+    return InlineKeyboardMarkup(rows)
+
+def pending_profiles_list_keyboard(profiles):
+    rows = [[btn(profile_button_label(p), f"open_pending_profile:{p['user_id']}")] for p in profiles]
+    rows.append([btn("🏠 В меню", "back_main")])
+    return InlineKeyboardMarkup(rows)
 
 # ─── Profile DB ───────────────────────────────────────────────────────────────
 
@@ -362,10 +378,6 @@ def build_unpaid_order_card_text(o):
 
 # ─── Admin notifications ──────────────────────────────────────────────────────
 
-async def notify_admins(context, text, reply_markup=None):
-    for aid in ADMIN_USER_IDS:
-        await context.bot.send_message(chat_id=aid, text=text, parse_mode="HTML", reply_markup=reply_markup)
-
 async def notify_admin_about_profile(profile, duplicates, context):
     text = (
         f"НОВЫЙ / ОБНОВЛЁННЫЙ ПРОФИЛЬ\n\nПользователь: {user_link(profile['user_id'], profile.get('full_name'))}\n"
@@ -385,7 +397,7 @@ async def notify_admin_about_profile(profile, duplicates, context):
             chat_id=aid,
             text=text,
             parse_mode="HTML",
-            reply_markup=profile_actions_keyboard(profile["user_id"], aid)
+            reply_markup=profile_actions_keyboard(profile["user_id"], aid, back_target="profiles_list")
         )
 
 async def notify_admin_about_pending_order(order_id, profile, uid, context):
@@ -394,7 +406,13 @@ async def notify_admin_about_pending_order(order_id, profile, uid, context):
             f"Username: {escape(fmt_username(profile.get('username')))}\nUser ID: {uid}\n"
             f"Телефон: {escape(profile['phone_original'])}\nТелефон normalized: {escape(profile['phone_normalized'])}\n"
             f"Организация original: {escape(profile['organization_original'])}\nСтатус организации: pending")
-    await notify_admins(context, text, org_confirm_keyboard("confirm_order_org", order_id))
+    for aid in ADMIN_USER_IDS:
+        await context.bot.send_message(
+            chat_id=aid,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=org_confirm_keyboard("confirm_order_org", order_id)
+        )
 
 # ─── Navigation helpers ───────────────────────────────────────────────────────
 
@@ -403,6 +421,36 @@ async def show_main_menu_message(message):
 
 async def show_main_menu_callback(query):
     await query.edit_message_text("Выберите категорию:", reply_markup=main_menu_keyboard())
+
+async def show_profiles_list(query_or_message, viewer_user_id):
+    profiles = get_profiles()
+    text = f"ПРОФИЛИ\n\nВсего профилей: {len(profiles)}\nНажмите на имя, чтобы открыть профиль."
+
+    if not profiles:
+        text = "Профилей пока нет."
+        markup = kb([btn("🏠 В меню", "back_main")])
+    else:
+        markup = profiles_list_keyboard(profiles, viewer_user_id)
+
+    if hasattr(query_or_message, "edit_message_text"):
+        await query_or_message.edit_message_text(text, reply_markup=markup)
+    else:
+        await query_or_message.reply_text(text, reply_markup=markup)
+
+async def show_pending_profiles_list(query_or_message, viewer_user_id):
+    profiles = get_pending_profiles()
+    text = f"ПРОФИЛИ БЕЗ ПОДТВЕРЖДЕНИЯ\n\nНайдено: {len(profiles)}\nНажмите на имя, чтобы открыть профиль."
+
+    if not profiles:
+        text = "Нет профилей с неподтверждённой организацией."
+        markup = kb([btn("🏠 В меню", "back_main")])
+    else:
+        markup = pending_profiles_list_keyboard(profiles)
+
+    if hasattr(query_or_message, "edit_message_text"):
+        await query_or_message.edit_message_text(text, reply_markup=markup)
+    else:
+        await query_or_message.reply_text(text, reply_markup=markup)
 
 # ─── Commands setup ───────────────────────────────────────────────────────────
 
@@ -638,7 +686,13 @@ async def final(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Статус организации: {escape(profile_data['organization_status'])}\n\n"
         f"{escape(cart_text)}\nВсего штук: {total_qty}\nСтатус оплаты: NEW"
     )
-    await notify_admins(context, admin_text, admin_order_keyboard(order_id))
+    for aid in ADMIN_USER_IDS:
+        await context.bot.send_message(
+            chat_id=aid,
+            text=admin_text,
+            parse_mode="HTML",
+            reply_markup=admin_order_keyboard(order_id)
+        )
 
     user_cart_store[uid] = []
     await query.edit_message_text(
@@ -714,7 +768,8 @@ async def confirm_profile_org(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode="HTML",
         reply_markup=profile_actions_keyboard(
             profile_user_id=p["user_id"],
-            viewer_user_id=query.from_user.id
+            viewer_user_id=query.from_user.id,
+            back_target="profiles_list"
         )
     )
 
@@ -739,7 +794,8 @@ async def keep_profile_pending(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode="HTML",
         reply_markup=profile_actions_keyboard(
             profile_user_id=p["user_id"],
-            viewer_user_id=query.from_user.id
+            viewer_user_id=query.from_user.id,
+            back_target="profiles_list"
         )
     )
 
@@ -768,7 +824,10 @@ async def delete_profile_execute(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
     _, uid = query.data.split(":", 1)
     if delete_profile_by_user_id(uid):
-        await query.edit_message_text(f"Профиль user_id={uid} удалён ✅\nИстория заказов сохранена.")
+        await query.edit_message_text(
+            f"Профиль user_id={uid} удалён ✅\nИстория заказов сохранена.",
+            reply_markup=kb([btn("🔙 К списку профилей", "profiles_list")])
+        )
     else:
         await query.edit_message_text("Профиль не найден или уже удалён.")
 
@@ -788,7 +847,8 @@ async def delete_profile_cancel(update: Update, context: ContextTypes.DEFAULT_TY
         parse_mode="HTML",
         reply_markup=profile_actions_keyboard(
             profile_user_id=p["user_id"],
-            viewer_user_id=query.from_user.id
+            viewer_user_id=query.from_user.id,
+            back_target="profiles_list"
         )
     )
 
@@ -823,6 +883,64 @@ async def keep_order_pending(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("Недостаточно прав", show_alert=True)
         return
     await query.answer("Оставлено без подтверждения")
+
+async def open_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, uid = query.data.split(":", 1)
+    p = get_profile(uid)
+    if not p:
+        await query.edit_message_text("Профиль не найден.")
+        return
+    await query.edit_message_text(
+        build_profile_card_text(p, header="ПРОФИЛЬ"),
+        parse_mode="HTML",
+        reply_markup=profile_actions_keyboard(
+            profile_user_id=p["user_id"],
+            viewer_user_id=query.from_user.id,
+            back_target="profiles_list"
+        )
+    )
+
+async def open_pending_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, uid = query.data.split(":", 1)
+    p = get_profile(uid)
+    if not p:
+        await query.edit_message_text("Профиль не найден.")
+        return
+    await query.edit_message_text(
+        build_profile_card_text(p, header="ПРОФИЛЬ БЕЗ ПОДТВЕРЖДЕНИЯ"),
+        parse_mode="HTML",
+        reply_markup=profile_actions_keyboard(
+            profile_user_id=p["user_id"],
+            viewer_user_id=query.from_user.id,
+            back_target="pending_profiles_list"
+        )
+    )
+
+async def profiles_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    await show_profiles_list(query, query.from_user.id)
+
+async def pending_profiles_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    await show_pending_profiles_list(query, query.from_user.id)
 
 async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -860,39 +978,11 @@ async def report_last_month(update, context):
 
 @admin_only
 async def profiles_command(update, context):
-    profiles = get_profiles()
-    if not profiles:
-        await update.message.reply_text("Профилей пока нет.")
-        return
-
-    await update.message.reply_text(f"Всего профилей: {len(profiles)}")
-
-    for p in profiles:
-        await update.message.reply_text(
-            build_profile_card_text(p, header="ПРОФИЛЬ"),
-            parse_mode="HTML",
-            reply_markup=profile_actions_keyboard(
-                profile_user_id=p["user_id"],
-                viewer_user_id=update.effective_user.id
-            )
-        )
+    await show_profiles_list(update.message, update.effective_user.id)
 
 @admin_only
 async def pending_profiles_command(update, context):
-    profiles = get_pending_profiles()
-    if not profiles:
-        await update.message.reply_text("Нет профилей с неподтверждённой организацией.")
-        return
-    await update.message.reply_text(f"Найдено профилей без подтверждения: {len(profiles)}")
-    for p in profiles:
-        await update.message.reply_text(
-            build_profile_card_text(p, header="ПРОФИЛЬ"),
-            parse_mode="HTML",
-            reply_markup=profile_actions_keyboard(
-                profile_user_id=p["user_id"],
-                viewer_user_id=update.effective_user.id
-            )
-        )
+    await show_pending_profiles_list(update.message, update.effective_user.id)
 
 @admin_only
 async def unpaid_orders_command(update, context):
@@ -936,10 +1026,16 @@ def main():
     app.add_handler(MessageHandler((filters.TEXT | filters.CONTACT) & ~filters.COMMAND, registration_handler))
 
     for pattern, handler in [
-        (r"^cat:", category), (r"^item:", item), (r"^add:", add),
-        (r"^cart$", cart), (r"^checkout$", checkout), (r"^final$", final),
-        (r"^clear$", clear), (r"^profile$", profile),
-        (r"^edit_phone$", edit_phone), (r"^edit_organization$", edit_organization),
+        (r"^cat:", category),
+        (r"^item:", item),
+        (r"^add:", add),
+        (r"^cart$", cart),
+        (r"^checkout$", checkout),
+        (r"^final$", final),
+        (r"^clear$", clear),
+        (r"^profile$", profile),
+        (r"^edit_phone$", edit_phone),
+        (r"^edit_organization$", edit_organization),
         (r"^(mark_paid|mark_unpaid):", mark_order_status),
         (r"^confirm_profile_org:", confirm_profile_org),
         (r"^keep_profile_pending:", keep_profile_pending),
@@ -948,7 +1044,12 @@ def main():
         (r"^delete_profile_cancel:", delete_profile_cancel),
         (r"^confirm_order_org:", confirm_order_org),
         (r"^keep_order_pending:", keep_order_pending),
-        (r"^back_main$", back_main), (r"^cancel$", cancel),
+        (r"^open_profile:", open_profile),
+        (r"^open_pending_profile:", open_pending_profile),
+        (r"^profiles_list$", profiles_list_callback),
+        (r"^pending_profiles_list$", pending_profiles_list_callback),
+        (r"^back_main$", back_main),
+        (r"^cancel$", cancel),
     ]:
         app.add_handler(CallbackQueryHandler(handler, pattern=pattern))
 
