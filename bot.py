@@ -169,6 +169,7 @@ def profile_keyboard():
     return kb(
         [btn("📞 Изменить телефон", "edit_phone")],
         [btn("🏢 Изменить организацию", "edit_organization")],
+        [btn("📋 Мои заказы", "my_orders")],
         [btn("🔙 Назад", "back_main")],
     )
 
@@ -309,6 +310,13 @@ def get_pending_profiles(limit=200):
 def get_unpaid_orders(limit=200):
     return db_fetchall(
         "SELECT * FROM orders WHERE payment_status IN ('new','unpaid') ORDER BY created_at DESC LIMIT ?", (limit,)
+    )
+
+def get_user_orders(uid, limit=10):
+    return db_fetchall(
+        "SELECT id, total_amount, total_qty, payment_status, order_status, created_at "
+        "FROM orders WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+        (str(uid), limit)
     )
 
 # ─── Reports ──────────────────────────────────────────────────────────────────
@@ -749,6 +757,30 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await query.edit_message_text(text, reply_markup=profile_keyboard())
 
+async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = str(query.from_user.id)
+    orders = get_user_orders(uid)
+    if not orders:
+        await query.edit_message_text(
+            "У вас пока нет заказов.",
+            reply_markup=kb([btn("🔙 Назад", "profile")])
+        )
+        return
+    lines = ["МОИ ЗАКАЗЫ\n"]
+    for o in orders:
+        date_str = o["created_at"][:10]
+        lines.append(
+            f"#{o['id']} | {date_str} | {o['total_amount']}₾ | {o['total_qty']} шт\n"
+            f"  Заказ: {order_status_label(o.get('order_status', 'new'))}\n"
+            f"  Оплата: {o['payment_status'].upper()}"
+        )
+    await query.edit_message_text(
+        "\n\n".join(lines),
+        reply_markup=kb([btn("🔙 Назад", "profile")])
+    )
+
 async def edit_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -768,8 +800,14 @@ async def mark_order_payment_status(update: Update, context: ContextTypes.DEFAUL
         return
     await query.answer()
     action, order_id = query.data.split(":")
-    update_order_payment_status(int(order_id), "paid" if action == "mark_paid" else "unpaid")
+    new_payment_status = "paid" if action == "mark_paid" else "unpaid"
+    update_order_payment_status(int(order_id), new_payment_status)
     order = get_order(order_id)
+    if new_payment_status == "paid":
+        await context.bot.send_message(
+            chat_id=int(order["user_id"]),
+            text=f"Ваш заказ #{order_id} оплачен ✅"
+        )
     await query.edit_message_text(
         build_unpaid_order_card_text(order),
         parse_mode="HTML",
@@ -816,6 +854,10 @@ async def confirm_profile_org(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     _, uid, canonical_org = query.data.split(":", 2)
     set_profile_canonical_org(uid, canonical_org)
+    await context.bot.send_message(
+        chat_id=int(uid),
+        text="Ваша организация подтверждена ✅\nТеперь вы можете оформить заказ."
+    )
     await _show_profile_card(query, uid)
 
 async def keep_profile_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1016,6 +1058,7 @@ def main():
         (r"^final$", final),
         (r"^clear$", clear),
         (r"^profile$", profile),
+        (r"^my_orders$", my_orders),
         (r"^edit_phone$", edit_phone),
         (r"^edit_organization$", edit_organization),
         (r"^(mark_paid|mark_unpaid):", mark_order_payment_status),
