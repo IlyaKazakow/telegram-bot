@@ -179,13 +179,12 @@ def contact_request_keyboard():
     )
 
 def admin_order_keyboard(order_id, order_status="new"):
-    row_flow = [btn("📦 Принят", f"mark_accepted:{order_id}")]
-    if order_status == "accepted":
-        row_flow.append(btn("🚚 Отправлен", f"mark_sent:{order_id}"))
-    return kb(
-        [btn("✅ Оплачен", f"mark_paid:{order_id}"), btn("❌ Не оплачен", f"mark_unpaid:{order_id}")],
-        row_flow,
-    )
+    rows = [[btn("✅ Оплачен", f"mark_paid:{order_id}"), btn("❌ Не оплачен", f"mark_unpaid:{order_id}")]]
+    if order_status == "new":
+        rows.append([btn("📦 Принят", f"mark_accepted:{order_id}")])
+    elif order_status == "accepted":
+        rows.append([btn("🚚 Отправлен", f"mark_sent:{order_id}")])
+    return kb(*rows)
 
 def profile_actions_keyboard(profile_user_id, viewer_user_id, back_target="profiles_list"):
     rows = [[btn(org, f"confirm_profile_org:{profile_user_id}:{org}")] for org in CANONICAL_ORGANIZATIONS]
