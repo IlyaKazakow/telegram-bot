@@ -1029,14 +1029,14 @@ async def open_order_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         reply_markup=admin_order_keyboard(
             int(order_id), order.get("order_status", "new"),
             back_target="month_orders_list",
-            show_delete=is_alexander(query.from_user.id),
+            show_delete=True,
         ),
     )
 
 async def delete_order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not is_alexander(query.from_user.id):
-        await query.answer("Удалять заказы может только Александр", show_alert=True)
+    if not is_admin(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
         return
     await query.answer()
     _, order_id = query.data.split(":", 1)
@@ -1056,8 +1056,8 @@ async def delete_order_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def delete_order_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not is_alexander(query.from_user.id):
-        await query.answer("Удалять заказы может только Александр", show_alert=True)
+    if not is_admin(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
         return
     await query.answer()
     _, order_id = query.data.split(":", 1)
@@ -1071,7 +1071,7 @@ async def delete_order_execute(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def delete_order_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not is_alexander(query.from_user.id):
+    if not is_admin(query.from_user.id):
         await query.answer("Недостаточно прав", show_alert=True)
         return
     await query.answer("Удаление отменено")
