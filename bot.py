@@ -152,6 +152,11 @@ def order_status_label(status):
         status, status.upper()
     )
 
+def order_button_label(o):
+    pay_icon = {"paid": "✅", "unpaid": "💰"}.get(o["payment_status"], "🆕")
+    name = (o.get("full_name") or "Без имени")[:20]
+    return f"{pay_icon} #{o['id']} {name} | {o['total_amount']}₾"
+
 # ─── Keyboards ────────────────────────────────────────────────────────────────
 
 def kb(*rows):
@@ -179,13 +184,21 @@ def contact_request_keyboard():
         resize_keyboard=True, one_time_keyboard=True,
     )
 
-def admin_order_keyboard(order_id, order_status="new"):
-    rows = [[btn("✅ Оплачен", f"mark_paid:{order_id}"), btn("❌ Не оплачен", f"mark_unpaid:{order_id}")]]
+def admin_order_keyboard(order_id, order_status="new", back_target=None):
+    src = f":{back_target}" if back_target else ""
+    rows = [[btn("✅ Оплачен", f"mark_paid:{order_id}{src}"), btn("❌ Не оплачен", f"mark_unpaid:{order_id}{src}")]]
     if order_status == "new":
-        rows.append([btn("📦 Принят", f"mark_accepted:{order_id}")])
+        rows.append([btn("📦 Принят", f"mark_accepted:{order_id}{src}")])
     elif order_status == "accepted":
-        rows.append([btn("🚚 Отправлен", f"mark_sent:{order_id}")])
+        rows.append([btn("🚚 Отправлен", f"mark_sent:{order_id}{src}")])
+    if back_target:
+        rows.append([btn("🔙 Назад к списку", back_target)])
     return kb(*rows)
+
+def orders_list_keyboard(orders):
+    rows = [[btn(order_button_label(o), f"open_order:{o['id']}")] for o in orders]
+    rows.append([btn("🏠 В меню", "back_main")])
+    return InlineKeyboardMarkup(rows)
 
 def profile_actions_keyboard(profile_user_id, viewer_user_id, back_target="profiles_list"):
     rows = [[btn(org, f"confirm_profile_org:{profile_user_id}:{org}")] for org in CANONICAL_ORGANIZATIONS]
@@ -312,6 +325,13 @@ def get_unpaid_orders(limit=200):
         "SELECT * FROM orders WHERE payment_status IN ('new','unpaid') ORDER BY created_at DESC LIMIT ?", (limit,)
     )
 
+def get_month_orders(limit=300):
+    start = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return db_fetchall(
+        "SELECT * FROM orders WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?",
+        (start.strftime("%Y-%m-%d %H:%M:%S"), limit)
+    )
+
 def get_user_orders(uid, limit=10):
     return db_fetchall(
         "SELECT id, total_amount, total_qty, payment_status, order_status, created_at "
@@ -396,6 +416,22 @@ def build_profile_card_text(p, header="ПРОФИЛЬ"):
         f"Создан: {escape(p['created_at'])}"
     )
 
+def build_full_order_card_text(o):
+    items = json.loads(o.get("items_json", "[]"))
+    cart_lines = [f"  {i['item']} x{i['qty']} = {i['qty'] * i['price']}₾" for i in items]
+    return (
+        f"ЗАКАЗ #{o['id']}\n\n"
+        f"Пользователь: {user_link(o['user_id'], o.get('full_name'))}\n"
+        f"Username: {escape(fmt_username(o.get('username')))}\n"
+        f"Телефон: {escape(o['phone_original'])}\n"
+        f"Организация: {escape(o.get('organization_canonical') or o['organization_original'])}\n"
+        f"Дата: {escape(o['created_at'])}\n\n"
+        f"СОСТАВ:\n{chr(10).join(cart_lines) if cart_lines else '—'}\n\n"
+        f"Итого: {o['total_amount']}₾ | {o['total_qty']} шт\n"
+        f"Статус заказа: {escape(order_status_label(o.get('order_status', 'new')))}\n"
+        f"Статус оплаты: {escape(o['payment_status'].upper())}"
+    )
+
 def build_unpaid_order_card_text(o):
     return (
         f"ЗАКАЗ #{o['id']}\n\n"
@@ -450,6 +486,19 @@ async def show_pending_profiles_list(target):
             profiles_list_keyboard(profiles, prefix="open_pending_profile"),
         )
 
+async def show_month_orders_list(target):
+    orders = get_month_orders()
+    if not orders:
+        await _send_or_edit(target, "Заказов за текущий месяц нет.", kb([btn("🏠 В меню", "back_main")]))
+        return
+    total_sum = sum(o["total_amount"] for o in orders)
+    paid = sum(1 for o in orders if o["payment_status"] == "paid")
+    await _send_or_edit(
+        target,
+        f"ЗАКАЗЫ ЗА МЕСЯЦ\n\nВсего: {len(orders)} | Оплачено: {paid}\nСумма: {total_sum}₾\n\nНажмите на заказ:",
+        orders_list_keyboard(orders),
+    )
+
 async def _show_profile_card(query, uid, back_target="profiles_list", header="ПРОФИЛЬ"):
     p = get_profile(uid)
     if not p:
@@ -476,6 +525,7 @@ async def set_commands(application):
             BotCommand("profiles", "Все профили"),
             BotCommand("pending_profiles", "Профили без подтверждения"),
             BotCommand("unpaid", "Неоплаченные заказы"),
+            BotCommand("month_orders", "Все заказы за месяц"),
         ], scope=BotCommandScopeChat(chat_id=aid))
 
 # ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -799,7 +849,9 @@ async def mark_order_payment_status(update: Update, context: ContextTypes.DEFAUL
         await query.answer("Недостаточно прав", show_alert=True)
         return
     await query.answer()
-    action, order_id = query.data.split(":")
+    parts = query.data.split(":")
+    action, order_id = parts[0], parts[1]
+    back_target = parts[2] if len(parts) > 2 else None
     new_payment_status = "paid" if action == "mark_paid" else "unpaid"
     update_order_payment_status(int(order_id), new_payment_status)
     order = get_order(order_id)
@@ -808,10 +860,11 @@ async def mark_order_payment_status(update: Update, context: ContextTypes.DEFAUL
             chat_id=int(order["user_id"]),
             text=f"Ваш заказ #{order_id} оплачен ✅"
         )
+    card_text = build_full_order_card_text(order) if back_target else build_unpaid_order_card_text(order)
     await query.edit_message_text(
-        build_unpaid_order_card_text(order),
+        card_text,
         parse_mode="HTML",
-        reply_markup=admin_order_keyboard(int(order_id), order.get("order_status", "new"))
+        reply_markup=admin_order_keyboard(int(order_id), order.get("order_status", "new"), back_target=back_target)
     )
 
 async def mark_order_flow_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -820,7 +873,9 @@ async def mark_order_flow_status(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer("Недостаточно прав", show_alert=True)
         return
     await query.answer()
-    action, order_id = query.data.split(":")
+    parts = query.data.split(":")
+    action, order_id = parts[0], parts[1]
+    back_target = parts[2] if len(parts) > 2 else None
     order = get_order(order_id)
     if not order:
         await query.edit_message_text("Заказ не найден.")
@@ -840,10 +895,11 @@ async def mark_order_flow_status(update: Update, context: ContextTypes.DEFAULT_T
         )
 
     updated_order = get_order(order_id)
+    card_text = build_full_order_card_text(updated_order) if back_target else build_unpaid_order_card_text(updated_order)
     await query.edit_message_text(
-        build_unpaid_order_card_text(updated_order),
+        card_text,
         parse_mode="HTML",
-        reply_markup=admin_order_keyboard(int(order_id), new_order_status)
+        reply_markup=admin_order_keyboard(int(order_id), new_order_status, back_target=back_target)
     )
 
 async def confirm_profile_org(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -935,6 +991,31 @@ async def keep_order_pending(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     await query.answer("Оставлено без подтверждения")
 
+async def open_order_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    _, order_id = query.data.split(":", 1)
+    order = get_order(order_id)
+    if not order:
+        await query.edit_message_text("Заказ не найден.")
+        return
+    await query.edit_message_text(
+        build_full_order_card_text(order),
+        parse_mode="HTML",
+        reply_markup=admin_order_keyboard(int(order_id), order.get("order_status", "new"), back_target="month_orders_list"),
+    )
+
+async def month_orders_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer()
+    await show_month_orders_list(query)
+
 async def open_profile_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not is_admin(query.from_user.id):
@@ -1009,6 +1090,10 @@ async def pending_profiles_command(update, context):
     await show_pending_profiles_list(update.message)
 
 @admin_only
+async def month_orders_command(update, context):
+    await show_month_orders_list(update.message)
+
+@admin_only
 async def unpaid_orders_command(update, context):
     orders = get_unpaid_orders()
     if not orders:
@@ -1047,6 +1132,7 @@ def main():
     app.add_handler(CommandHandler("profiles", profiles_command))
     app.add_handler(CommandHandler("pending_profiles", pending_profiles_command))
     app.add_handler(CommandHandler("unpaid", unpaid_orders_command))
+    app.add_handler(CommandHandler("month_orders", month_orders_command))
     app.add_handler(MessageHandler((filters.TEXT | filters.CONTACT) & ~filters.COMMAND, registration_handler))
 
     for pattern, handler in [
@@ -1070,6 +1156,8 @@ def main():
         (r"^delete_profile_cancel:", delete_profile_cancel),
         (r"^confirm_order_org:", confirm_order_org),
         (r"^keep_order_pending:", keep_order_pending),
+        (r"^open_order:", open_order_handler),
+        (r"^month_orders_list$", month_orders_list_callback),
         (r"^open_(pending_)?profile:", open_profile_handler),
         (r"^profiles_list$", profiles_list_callback),
         (r"^pending_profiles_list$", pending_profiles_list_callback),
@@ -1084,3 +1172,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
