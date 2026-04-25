@@ -184,19 +184,30 @@ def contact_request_keyboard():
         resize_keyboard=True, one_time_keyboard=True,
     )
 
-def admin_order_keyboard(order_id, order_status="new", back_target=None):
+def admin_order_keyboard(order_id, order_status="new", back_target=None, show_delete=False):
     src = f":{back_target}" if back_target else ""
     rows = [[btn("✅ Оплачен", f"mark_paid:{order_id}{src}"), btn("❌ Не оплачен", f"mark_unpaid:{order_id}{src}")]]
     if order_status == "new":
         rows.append([btn("📦 Принят", f"mark_accepted:{order_id}{src}")])
     elif order_status == "accepted":
         rows.append([btn("🚚 Отправлен", f"mark_sent:{order_id}{src}")])
+    if show_delete:
+        rows.append([btn("🗑 Удалить заказ", f"delete_order_confirm:{order_id}")])
     if back_target:
         rows.append([btn("🔙 Назад к списку", back_target)])
     return kb(*rows)
 
 def orders_list_keyboard(orders):
-    rows = [[btn(order_button_label(o), f"open_order:{o['id']}")] for o in orders]
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for o in orders:
+        org = o.get("organization_canonical") or o.get("organization_original") or "Неизвестно"
+        groups[org].append(o)
+    rows = []
+    for org, org_orders in groups.items():
+        rows.append([btn(f"── {org} ──", "noop")])
+        for o in org_orders:
+            rows.append([btn(order_button_label(o), f"open_order:{o['id']}")])
     rows.append([btn("🏠 В меню", "back_main")])
     return InlineKeyboardMarkup(rows)
 
@@ -220,6 +231,12 @@ def delete_profile_confirm_keyboard(uid):
     return kb(
         [btn("✅ Да, удалить", f"delete_profile_execute:{uid}")],
         [btn("❌ Отмена", f"delete_profile_cancel:{uid}")],
+    )
+
+def delete_order_confirm_keyboard(order_id):
+    return kb(
+        [btn("✅ Да, удалить заказ", f"delete_order_execute:{order_id}")],
+        [btn("❌ Отмена", f"delete_order_cancel:{order_id}")],
     )
 
 def pending_org_block_keyboard():
@@ -308,6 +325,10 @@ def set_order_canonical_org(order_id, canonical_org):
 
 def update_order_payment_status(order_id, status):
     db_execute("UPDATE orders SET payment_status=? WHERE id=?", (status, int(order_id)))
+
+def delete_order_by_id(order_id):
+    with get_connection() as conn:
+        return conn.execute("DELETE FROM orders WHERE id=?", (int(order_id),)).rowcount > 0
 
 def update_order_status(order_id, status):
     db_execute("UPDATE orders SET order_status=? WHERE id=?", (status, int(order_id)))
@@ -1005,8 +1026,72 @@ async def open_order_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text(
         build_full_order_card_text(order),
         parse_mode="HTML",
-        reply_markup=admin_order_keyboard(int(order_id), order.get("order_status", "new"), back_target="month_orders_list"),
+        reply_markup=admin_order_keyboard(
+            int(order_id), order.get("order_status", "new"),
+            back_target="month_orders_list",
+            show_delete=is_alexander(query.from_user.id),
+        ),
     )
+
+async def delete_order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_alexander(query.from_user.id):
+        await query.answer("Удалять заказы может только Александр", show_alert=True)
+        return
+    await query.answer()
+    _, order_id = query.data.split(":", 1)
+    order = get_order(order_id)
+    if not order:
+        await query.edit_message_text("Заказ не найден или уже удалён.")
+        return
+    name = order.get("full_name") or "-"
+    org = order.get("organization_canonical") or order.get("organization_original") or "-"
+    await query.edit_message_text(
+        f"ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ ЗАКАЗА\n\n"
+        f"Заказ #{order_id}\nПользователь: {name}\nОрганизация: {org}\n"
+        f"Сумма: {order['total_amount']}₾ | {order['total_qty']} шт\nДата: {order['created_at']}\n\n"
+        "⚠️ Заказ будет удалён безвозвратно.",
+        reply_markup=delete_order_confirm_keyboard(order_id),
+    )
+
+async def delete_order_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_alexander(query.from_user.id):
+        await query.answer("Удалять заказы может только Александр", show_alert=True)
+        return
+    await query.answer()
+    _, order_id = query.data.split(":", 1)
+    if delete_order_by_id(order_id):
+        await query.edit_message_text(
+            f"Заказ #{order_id} удалён ✅",
+            reply_markup=kb([btn("🔙 К списку заказов", "month_orders_list")])
+        )
+    else:
+        await query.edit_message_text("Заказ не найден или уже удалён.")
+
+async def delete_order_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_alexander(query.from_user.id):
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+    await query.answer("Удаление отменено")
+    _, order_id = query.data.split(":", 1)
+    order = get_order(order_id)
+    if not order:
+        await query.edit_message_text("Заказ не найден.")
+        return
+    await query.edit_message_text(
+        build_full_order_card_text(order),
+        parse_mode="HTML",
+        reply_markup=admin_order_keyboard(
+            int(order_id), order.get("order_status", "new"),
+            back_target="month_orders_list",
+            show_delete=True,
+        ),
+    )
+
+async def noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
 
 async def month_orders_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1157,7 +1242,11 @@ def main():
         (r"^confirm_order_org:", confirm_order_org),
         (r"^keep_order_pending:", keep_order_pending),
         (r"^open_order:", open_order_handler),
+        (r"^delete_order_confirm:", delete_order_confirm),
+        (r"^delete_order_execute:", delete_order_execute),
+        (r"^delete_order_cancel:", delete_order_cancel),
         (r"^month_orders_list$", month_orders_list_callback),
+        (r"^noop$", noop),
         (r"^open_(pending_)?profile:", open_profile_handler),
         (r"^profiles_list$", profiles_list_callback),
         (r"^pending_profiles_list$", pending_profiles_list_callback),
@@ -1172,4 +1261,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
