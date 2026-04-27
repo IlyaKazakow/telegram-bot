@@ -94,6 +94,8 @@ def init_db():
         """)
         if not column_exists(conn, "orders", "order_status"):
             conn.execute("ALTER TABLE orders ADD COLUMN order_status TEXT NOT NULL DEFAULT 'new'")
+        if not column_exists(conn, "orders", "viewed"):
+            conn.execute("ALTER TABLE orders ADD COLUMN viewed INTEGER NOT NULL DEFAULT 0")
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -153,9 +155,12 @@ def order_status_label(status):
     )
 
 def order_button_label(o):
-    pay_icon = {"paid": "✅", "unpaid": "💰"}.get(o["payment_status"], "🆕")
+    if not o.get("viewed"):
+        icon = "🆕"
+    else:
+        icon = "✅" if o["payment_status"] == "paid" else "❌"
     name = (o.get("full_name") or "Без имени")[:20]
-    return f"{pay_icon} #{o['id']} {name} | {o['total_amount']}₾"
+    return f"{icon} #{o['id']} {name} | {o['total_amount']}₾"
 
 # ─── Keyboards ────────────────────────────────────────────────────────────────
 
@@ -1023,6 +1028,9 @@ async def open_order_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not order:
         await query.edit_message_text("Заказ не найден.")
         return
+    if not order.get("viewed"):
+        db_execute("UPDATE orders SET viewed=1 WHERE id=?", (int(order_id),))
+        order = get_order(order_id)
     await query.edit_message_text(
         build_full_order_card_text(order),
         parse_mode="HTML",
