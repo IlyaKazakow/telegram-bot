@@ -155,12 +155,10 @@ def order_status_label(status):
     )
 
 def order_button_label(o):
-    if not o.get("viewed"):
-        icon = "🆕"
-    else:
-        icon = "✅" if o["payment_status"] == "paid" else "❌"
+    new_icon = "🆕 " if not o.get("viewed") else ""
+    pay_icon = "✅" if o["payment_status"] == "paid" else "❌"
     name = (o.get("full_name") or "Без имени")[:20]
-    return f"{icon} #{o['id']} {name} | {o['total_amount']}₾"
+    return f"{new_icon}{pay_icon} #{o['id']} {name} | {o['total_amount']}₾"
 
 # ─── Keyboards ────────────────────────────────────────────────────────────────
 
